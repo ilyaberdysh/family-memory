@@ -1,0 +1,7 @@
+.tree-canvas .react-flow__edge-path { stroke-linecap: round; }
+.tree-canvas .react-flow__edge-textbg { fill: #fafbfc; }
+.tree-canvas .canvas-caption { color: #6d7889; background: #fafbfce8; border-radius: 6px; padding: 5px 8px; font-size: 11px; }
+@media (max-width: 759px) {
+  .tree-canvas .canvas-caption { max-width: calc(100% - 86px); font-size: 10px; white-space: normal; text-align: right; bottom: 15px; }
+}
+@media (prefers-reduced-transparency: reduce) { .tree-canvas .canvas-caption { background: #fafbfc; } }

@@ -1,0 +1,25 @@
+services:
+  app:
+    build: .
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      DEV_AUTH: "0"
+      HOST: 0.0.0.0
+      PORT: "4317"
+      DATA_DIR: ${DATA_DIR:-/var/lib/family-space/data}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Set the HTTPS application origin in .env}
+      ADMIN_TELEGRAM_ID: ${ADMIN_TELEGRAM_ID:-}
+      TELEGRAM_CLIENT_ID: ${TELEGRAM_CLIENT_ID:-}
+      TELEGRAM_CLIENT_SECRET: ${TELEGRAM_CLIENT_SECRET:-}
+      TRUST_PROXY: "1"
+    ports:
+      - "127.0.0.1:4317:4317"
+    volumes:
+      - family_data:/var/lib/family-space
+    stop_grace_period: 60s
+
+volumes:
+  family_data:
