@@ -76,8 +76,9 @@ Coolify может дописать UUID ресурса к имени тома �
 
 Откройте **Environment Variables** приложения и перенесите значения из
 [.env.coolify.example](.env.coolify.example), заменив домен своим.
-Все эти переменные нужны во время выполнения. Для секретов выключите
-**Build Variable**: сборке frontend они не нужны. Не используйте префикс `VITE_`
+Для всех перечисленных переменных включите **Runtime Variable** и выключите
+**Build Variable**, включая `NODE_ENV`: сборка должна установить и devDependencies.
+Сборке frontend секреты не нужны. Не используйте префикс `VITE_`
 для ключей и не добавляйте `.env` в GitHub.
 [Runtime-переменные Coolify](https://coolify.io/docs/knowledge-base/environment-variables).
 
