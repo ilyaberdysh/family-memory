@@ -21,6 +21,7 @@ const TOKEN_URL = `${ISSUER}/token`;
 const JWKS_URL = `${ISSUER}/.well-known/jwks.json`;
 const DISCOVERY_URL = `${ISSUER}/.well-known/openid-configuration`;
 const FAILURE = 'Не удалось подтвердить вход через Telegram. Начните вход заново.';
+const diagnosticToken = /^[A-Za-z0-9_.:-]{1,96}$/;
 const inputs = z.object({
   state: z.string().min(1).max(512), nonce: z.string().min(1).max(512),
   verifier: z.string().regex(/^[A-Za-z0-9._~-]{43,128}$/), redirectUri: z.string().max(2048),
@@ -38,6 +39,13 @@ function checkInput(input: AuthorizationInput): URL {
   const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(redirect.hostname);
   if ((redirect.protocol !== 'https:' && !(redirect.protocol === 'http:' && loopback)) || redirect.username || redirect.password || redirect.hash || redirect.search) throw new Error(FAILURE);
   return redirect;
+}
+
+function reportFailure(stage: 'configuration' | 'authorization' | 'exchange', error: unknown) {
+  if (process.env.NODE_ENV !== 'production') return;
+  const value = error && typeof error === 'object' ? error as Record<string, unknown> : {};
+  const field = (name: string) => typeof value[name] === 'string' && diagnosticToken.test(value[name]) ? value[name] : undefined;
+  console.error(JSON.stringify({ event: 'telegram_oidc_failure', stage, name: field('name'), code: field('code'), oauthError: field('error'), status: typeof value.status === 'number' ? value.status : undefined }));
 }
 
 /** Fixed Telegram OIDC endpoints; no userinfo, bot messaging, or persistence. */
@@ -62,7 +70,7 @@ export function createTelegramProvider(): TelegramProvider {
       const metadata = config.serverMetadata();
       if (metadata.issuer !== ISSUER || metadata.authorization_endpoint !== AUTHORIZATION_URL || metadata.token_endpoint !== TOKEN_URL || metadata.jwks_uri !== JWKS_URL) throw new Error(FAILURE);
       return config;
-    }).catch(() => { pendingConfiguration = undefined; throw new Error(FAILURE); });
+    }).catch(error => { pendingConfiguration = undefined; reportFailure('configuration', error); throw new Error(FAILURE); });
     return pendingConfiguration;
   };
   return {
@@ -77,7 +85,7 @@ export function createTelegramProvider(): TelegramProvider {
           state: input.state, nonce: input.nonce,
           code_challenge: await oidc.calculatePKCECodeChallenge(input.verifier), code_challenge_method: 'S256',
         }).href;
-      } catch { throw new Error(FAILURE); }
+      } catch (error) { reportFailure('authorization', error); throw new Error(FAILURE); }
     },
     async exchange(input) {
       if (!configured) throw new Error('Вход через Telegram не настроен.');
@@ -96,8 +104,9 @@ export function createTelegramProvider(): TelegramProvider {
         const phone = claims?.phone_number_verified === true && typeof rawPhone === 'string' && /^\+?[1-9]\d{6,14}$/.test(rawPhone)
           ? `+${rawPhone.replace(/^\+/, '')}` : undefined;
         return { subject: identity.sub, telegramId: String(identity.id), name: identity.name, ...(phone ? { phone } : {}), phoneVerified: Boolean(phone) };
-      } catch {
+      } catch (error) {
         // Library errors may include callback codes, tokens, private claims or upstream bodies.
+        reportFailure('exchange', error);
         throw new Error(FAILURE);
       }
     },
