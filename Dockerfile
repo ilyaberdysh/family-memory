@@ -1,7 +1,9 @@
 FROM node:24-trixie-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci
+RUN npm ci --include=dev --include=optional \
+    && npm install --no-save --include=dev --include=optional \
+    && node -e "import('rolldown')"
 COPY tsconfig.json vite.config.ts index.html ./
 COPY shared ./shared
 COPY server ./server
