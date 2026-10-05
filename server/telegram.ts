@@ -28,7 +28,8 @@ const inputs = z.object({
 });
 const identityClaims = z.object({
   sub: z.string().min(1).max(512).refine(value => value.trim() === value && Boolean(value.trim())),
-  id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+  // Telegram documents a numeric id but currently issues it as a decimal string.
+  id: z.union([z.number().int().positive().max(Number.MAX_SAFE_INTEGER), z.string().regex(/^[1-9]\d{0,19}$/)]),
   name: z.string().trim().min(1).max(302),
   iat: z.number().int().nonnegative(), exp: z.number().int().positive(),
 });
@@ -76,7 +77,21 @@ export function createTelegramProvider(): TelegramProvider {
       execute: [oidc.enableNonRepudiationChecks],
       [oidc.customFetch]: async (url, options) => {
         if (![DISCOVERY_URL, TOKEN_URL, JWKS_URL].includes(url)) throw new Error(FAILURE);
-        return fetch(url, { ...options, body: options.body as BodyInit | null, redirect: 'error' });
+        if (url !== TOKEN_URL) return fetch(url, { ...options, body: options.body as BodyInit | null, redirect: 'error' });
+        // Send exactly Telegram's documented request. Its Basic credentials are the raw base64(client_id:client_secret);
+        // the library form-encodes them first (`_` becomes %5F, `-` becomes %2D), which Telegram rejects as invalid_client.
+        const sent = new URLSearchParams(String(options.body));
+        const body = new URLSearchParams();
+        for (const name of ['grant_type', 'code', 'redirect_uri', 'client_id', 'code_verifier']) if (sent.has(name)) body.set(name, sent.get(name)!);
+        const response = await fetch(url, {
+          method: 'POST', signal: options.signal, redirect: 'error', body,
+          headers: { authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString('base64')}`, 'content-type': 'application/x-www-form-urlencoded' },
+        });
+        // Telegram reports token errors with HTTP 200; restore the standard 400 so the OAuth error code surfaces.
+        const text = await response.text();
+        let error = false;
+        try { const json = JSON.parse(text); error = response.ok && typeof json?.error === 'string' && json.access_token === undefined; } catch { /* non-JSON is handled by the library */ }
+        return new Response(text, { status: error ? 400 : response.status, headers: { 'content-type': response.headers.get('content-type') ?? 'application/json' } });
       },
     }).then(config => {
       const metadata = config.serverMetadata();

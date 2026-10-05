@@ -5,7 +5,7 @@ import { createTelegramProvider } from '../server/telegram.js';
 
 const issuer = 'https://oauth.telegram.org';
 const clientId = '123456789';
-const secret = 'mock-client-secret';
+const secret = 'mock_client-secret.with_symbols';
 const input = { state: 'random-state-for-this-login', nonce: 'random-nonce-for-this-login', verifier: 'a'.repeat(64), redirectUri: 'https://family.example.test/api/auth/telegram/callback' };
 const callbackUrl = `${input.redirectUri}?code=one-time-test-code&state=${input.state}`;
 const key = generateKeyPairSync('rsa', { modulusLength: 2048 });
@@ -16,7 +16,7 @@ function token(data: Record<string, unknown>, wrongKey = false, alg = 'RS256') {
   const encoded = [Buffer.from(JSON.stringify({ alg, kid: 'test-key', typ: 'JWT' })).toString('base64url'), Buffer.from(JSON.stringify(data)).toString('base64url')].join('.');
   return `${encoded}.${sign('RSA-SHA256', Buffer.from(encoded), wrongKey ? otherKey.privateKey : key.privateKey).toString('base64url')}`;
 }
-function setup(t: TestContext, reply: () => string, discovery = metadata) {
+function setup(t: TestContext, reply: () => string | Record<string, unknown>, discovery = metadata) {
   const previous = [process.env.TELEGRAM_CLIENT_ID, process.env.TELEGRAM_CLIENT_SECRET];
   process.env.TELEGRAM_CLIENT_ID = clientId;
   process.env.TELEGRAM_CLIENT_SECRET = secret;
@@ -35,10 +35,13 @@ function setup(t: TestContext, reply: () => string, discovery = metadata) {
       assert.equal(endpoint, `${issuer}/token`, 'no userinfo or unexpected external endpoint');
       tokenRequests++;
       assert.equal(options?.method, 'POST');
-      const authorization = new Headers(options?.headers).get('authorization') ?? '';
+      const headers = new Headers(options?.headers);
+      assert.deepEqual([...headers.keys()].sort(), ['authorization', 'content-type'], 'Telegram accepts only the documented token request headers');
+      assert.equal(headers.get('content-type'), 'application/x-www-form-urlencoded');
+      const authorization = headers.get('authorization') ?? '';
       assert.ok(authorization.startsWith('Basic '));
-      const credentials = Buffer.from(authorization.slice(6), 'base64').toString('utf8').split(':').map(value => decodeURIComponent(value.replace(/\+/g, ' ')));
-      assert.deepEqual(credentials, [clientId, secret]);
+      // Telegram compares raw base64(client_id:client_secret); form-encoded `_` or `-` is rejected as invalid_client.
+      assert.equal(authorization, `Basic ${Buffer.from(`${clientId}:${secret}`).toString('base64')}`);
       const body = new URLSearchParams(String(options?.body));
       assert.equal(body.get('grant_type'), 'authorization_code');
       assert.equal(body.get('code'), 'one-time-test-code');
@@ -46,7 +49,9 @@ function setup(t: TestContext, reply: () => string, discovery = metadata) {
       assert.equal(body.get('redirect_uri'), input.redirectUri);
       assert.equal(body.get('client_id'), clientId);
       assert.equal(body.has('client_secret'), false);
-      return Response.json({ access_token: 'mock-access-token', token_type: 'Bearer', expires_in: 3600, id_token: reply() });
+      assert.deepEqual([...body.keys()], ['grant_type', 'code', 'redirect_uri', 'client_id', 'code_verifier'], 'documented parameter order');
+      const answer = reply();
+      return Response.json(typeof answer === 'string' ? { access_token: 'mock-access-token', token_type: 'Bearer', expires_in: 3600, scope: 'openid profile phone', id_token: answer } : answer);
     } catch (error) { networkError = error; throw error; }
   });
   return { provider: createTelegramProvider(), calls, tokenRequests: () => tokenRequests, networkError: () => networkError };
@@ -120,4 +125,22 @@ test('production diagnostics name the failed check and claim keys without leakin
   assert.equal(event.message, 'JWT "nonce" (nonce) claim missing');
   assert.ok(event.claimKeys.includes('sub') && !event.claimKeys.includes('nonce'));
   for (const secretValue of ['opaque-stable-subject', '987654321', 'Тестовый', '79991234567', 'mock-access-token', 'one-time-test-code']) assert.equal(logged[0].includes(secretValue), false);
+});
+
+test('Telegram string ids are accepted and HTTP 200 token errors surface as OAuth errors', async t => {
+  let answer: string | Record<string, unknown> = token({ ...claims(), id: '987654321' });
+  const fixture = setup(t, () => answer);
+  assert.equal((await fixture.provider.exchange({ ...input, callbackUrl })).telegramId, '987654321');
+  for (const id of ['0123', '12a', '']) {
+    answer = token({ ...claims(), id });
+    await assert.rejects(() => fixture.provider.exchange({ ...input, callbackUrl }));
+  }
+  const previous = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'production';
+  t.after(() => { if (previous === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = previous; });
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (line: string) => { logged.push(line); });
+  answer = { error: 'invalid_grant' };
+  await assert.rejects(() => fixture.provider.exchange({ ...input, callbackUrl }), /Начните вход заново/);
+  assert.equal(JSON.parse(logged.at(-1)!).oauthError, 'invalid_grant');
 });
