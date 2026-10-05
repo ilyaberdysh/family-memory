@@ -45,7 +45,19 @@ function reportFailure(stage: 'configuration' | 'authorization' | 'exchange', er
   if (process.env.NODE_ENV !== 'production') return;
   const value = error && typeof error === 'object' ? error as Record<string, unknown> : {};
   const field = (name: string) => typeof value[name] === 'string' && diagnosticToken.test(value[name]) ? value[name] : undefined;
-  console.error(JSON.stringify({ event: 'telegram_oidc_failure', stage, name: field('name'), code: field('code'), oauthError: field('error'), status: typeof value.status === 'number' ? value.status : undefined }));
+  // openid-client wraps the oauth4webapi error, whose message is a fixed string naming the failed check.
+  // Its cause contributes only key names and JOSE header metadata, never values.
+  const inner = value.name === 'ClientError' && value.cause && typeof value.cause === 'object' ? value.cause as Record<string, unknown> : {};
+  const message = inner.name === 'OperationProcessingError' && typeof inner.message === 'string' && /^[\w "().,:`'-]{1,160}$/.test(inner.message) ? inner.message : undefined;
+  const cause = inner.cause && typeof inner.cause === 'object' ? inner.cause as Record<string, unknown> : {};
+  const keys = (name: string) => cause[name] && typeof cause[name] === 'object' && !Array.isArray(cause[name])
+    ? Object.keys(cause[name]).filter(key => diagnosticToken.test(key)).slice(0, 40) : undefined;
+  const header = cause.header && typeof cause.header === 'object' ? cause.header as Record<string, unknown> : {};
+  const headerField = (name: string) => typeof header[name] === 'string' && /^[A-Za-z0-9+_.-]{1,32}$/.test(header[name]) ? header[name] : undefined;
+  console.error(JSON.stringify({
+    event: 'telegram_oidc_failure', stage, name: field('name'), code: field('code'), oauthError: field('error'), status: typeof value.status === 'number' ? value.status : undefined,
+    message, claimKeys: keys('claims'), bodyKeys: keys('body'), parameterKeys: keys('parameters'), alg: headerField('alg'), typ: headerField('typ'), claim: typeof cause.claim === 'string' && diagnosticToken.test(cause.claim) ? cause.claim : undefined,
+  }));
 }
 
 /** Fixed Telegram OIDC endpoints; no userinfo, bot messaging, or persistence. */

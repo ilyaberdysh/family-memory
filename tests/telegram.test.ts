@@ -104,3 +104,20 @@ test('missing configuration and unexpected discovery endpoints fail closed befor
   await assert.rejects(() => unavailable.exchange({ ...input, callbackUrl }), /не настроен/);
   assert.deepEqual(fixture.calls, [`${issuer}/.well-known/openid-configuration`]);
 });
+
+test('production diagnostics name the failed check and claim keys without leaking claim values', async t => {
+  const { nonce: _nonce, ...withoutNonce } = claims();
+  const fixture = setup(t, () => token(withoutNonce));
+  const previous = process.env.NODE_ENV;
+  process.env.NODE_ENV = 'production';
+  t.after(() => { if (previous === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = previous; });
+  const logged: string[] = [];
+  t.mock.method(console, 'error', (line: string) => { logged.push(line); });
+  await assert.rejects(() => fixture.provider.exchange({ ...input, callbackUrl }));
+  assert.equal(logged.length, 1);
+  const event = JSON.parse(logged[0]);
+  assert.equal(event.code, 'OAUTH_INVALID_RESPONSE');
+  assert.equal(event.message, 'JWT "nonce" (nonce) claim missing');
+  assert.ok(event.claimKeys.includes('sub') && !event.claimKeys.includes('nonce'));
+  for (const secretValue of ['opaque-stable-subject', '987654321', 'Тестовый', '79991234567', 'mock-access-token', 'one-time-test-code']) assert.equal(logged[0].includes(secretValue), false);
+});
