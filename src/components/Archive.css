@@ -84,7 +84,7 @@
 .archive-recorder { padding: 22px; background: #f9f5f0; border: 1px solid var(--line, #ede7e1); border-radius: 13px; }
 .archive-recorder-heading { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
 .archive-recorder-heading strong { font-size: 14px; }
-.archive-recorder-heading p { font-size: 11px; margin: 5px 0 0; }
+.archive-recorder-heading p { font-size: 13px; line-height: 1.5; margin: 5px 0 0; color: #6c6156; }
 .archive-recorder-icon { width: 48px; height: 48px; border-radius: 14px; display: grid; place-items: center; color: #5d534a; background: var(--line, #ede7e1); flex-shrink: 0; }
 .archive-recorder-icon.is-recording { background: #fff2f0; color: #b42318; }
 .archive-recorder-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
@@ -92,6 +92,20 @@
 .archive-recorder-time { font-size: 24px; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
 .archive-recorder audio { width: 100%; margin: 0 0 12px; }
 .archive-recorder > .muted { font-size: 12px; line-height: 1.6; margin: 12px 0 0; }
+.archive-recorder-warning { margin: 12px 0 0; padding: 10px 12px; border-radius: 9px; background: #fff4e5; border: 1px solid #f0d7b0; color: #74440f; font-size: 13px; line-height: 1.6; }
+.archive-recorder-backup { margin: 12px 0 0; color: #6c6156; font-size: 12px; line-height: 1.6; }
+.archive-recorder-copy { display: flex; flex-wrap: wrap; align-items: center; gap: 0 16px; margin: -6px 0 10px; }
+.archive-recorder-copy a, .archive-recorder-copy button { display: inline-flex; align-items: center; gap: 6px; min-height: 44px; padding: 0 2px; border: 0; background: none; color: var(--blue, #315f89); font-size: 13px; font-weight: 500; text-decoration: none; }
+.archive-recorder-copy > p { flex-basis: 100%; margin: 0; color: #a6372c; font-size: 12px; }
+.archive-recorder-found { margin-top: 14px; padding: 12px 14px; border: 1px dashed #dcc9b2; border-radius: 11px; background: #fffaf3; }
+.archive-recorder-found > p { display: flex; gap: 8px; margin: 0 0 6px; color: #4c433a; font-size: 13px; line-height: 1.6; }
+.archive-recorder-found > p > svg { margin-top: 3px; color: #93652c; }
+.archive-recorder-found-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 8px 0 2px; border-top: 1px solid #f1e6d8; }
+.archive-recorder-found-row > span { flex: 1 1 180px; min-width: 0; color: #3f362d; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.archive-recorder-found-row small { display: block; color: #776c61; font-size: 12px; }
+.archive-recorder-found-row .button { min-height: 44px; white-space: normal; }
+.archive-upload-progress .archive-text-button { align-self: flex-start; padding-inline: 2px; font-size: 13px; }
+.archive-card-preview-note { margin: 6px 0 4px; font-size: 12px; }
 .archive-detail-loading { padding: 25px 0 45px; }
 .archive-detail { min-width: 0; max-width: 100%; color: #5d534a; }
 .modal:has(.archive-detail, .archive-form, .archive-detail-loading) .modal-heading { min-width: 0; align-items: flex-start; }

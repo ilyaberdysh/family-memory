@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { createApp } from '../server/app.js';
 import type { AppState, Fact, Material, Proposal, Person } from '../shared/types.js';
 
@@ -149,10 +151,13 @@ test('browser previews normalize recordings and video while authenticated origin
       const bytes = await readFile(path);
       const data = new FormData(); data.append('file', new Blob([bytes]), sample.name);
       const response = await fetch(f.base + '/api/files', { method: 'POST', headers: { Cookie: f.admin.cookie, 'X-Requested-With': 'family-space' }, body: data });
-      const file = await response.json() as { id: string; url: string; mime: string; error?: string };
-      assert.equal(response.status, 201, file.error ?? 'Preview preparation should succeed'); assert.equal(file.mime, sample.previewMime);
-      const record = f.store.get<{ mime: string; path: string; previewPath: string }>('files', file.id)!;
-      assert.equal(record.mime, sample.inputMime); assert.ok(record.previewPath);
+      const file = await response.json() as { id: string; url: string; mime: string; previewStatus: string; error?: string };
+      // The original is accepted first; the browser copy follows in the background.
+      assert.equal(response.status, 201, file.error ?? 'The original should be accepted'); assert.equal(file.mime, sample.inputMime); assert.equal(file.previewStatus, 'pending');
+      await f.processMedia();
+      const record = f.store.get<{ mime: string; path: string; previewPath: string; previewStatus: string; sha256: string }>('files', file.id)!;
+      assert.equal(record.mime, sample.inputMime); assert.ok(record.previewPath); assert.equal(record.previewStatus, 'ready');
+      assert.equal(record.sha256, createHash('sha256').update(bytes).digest('hex'));
       const original = await fetch(f.base + file.url + '?original=1', { headers: { Cookie: f.admin.cookie } });
       assert.equal(original.headers.get('content-type'), sample.inputMime);
       assert.deepEqual(Buffer.from(await original.arrayBuffer()), bytes);
@@ -161,6 +166,63 @@ test('browser previews normalize recordings and video while authenticated origin
       assert.equal(preview.status, 206); assert.equal(preview.headers.get('content-type'), sample.previewMime);
       assert.deepEqual(Buffer.from(await preview.arrayBuffer()), (await readFile(join(f.store.filesDir, record.previewPath))).subarray(0, 32));
     }
+  } finally { await f.cleanup(); await rm(generated, { recursive: true, force: true }); }
+});
+
+test('an original survives a failed browser copy and digitised archive formats are accepted', async () => {
+  const f = await fixture();
+  const generated = await mkdtemp(join(tmpdir(), 'family-space-formats-'));
+  const execute = promisify(execFile);
+  const send = async (bytes: Buffer, name: string) => {
+    const data = new FormData(); data.append('file', new Blob([new Uint8Array(bytes)]), name);
+    const response = await fetch(f.base + '/api/files', { method: 'POST', headers: { Cookie: f.admin.cookie, 'X-Requested-With': 'family-space' }, body: data });
+    return { status: response.status, body: await response.json() as { id: string; url: string; mime: string; previewStatus: string; error?: string } };
+  };
+  try {
+    const samples = [
+      { name: 'scan.tif', mime: 'image/tiff', args: ['-f', 'lavfi', '-i', 'color=c=gray:s=48x32:d=1', '-frames:v', '1', '-c:v', 'tiff'] },
+      { name: 'scan.bmp', mime: 'image/bmp', args: ['-f', 'lavfi', '-i', 'color=c=gray:s=48x32:d=1', '-frames:v', '1', '-c:v', 'bmp'] },
+      { name: 'camcorder.avi', mime: 'video/x-msvideo', args: ['-f', 'lavfi', '-i', 'color=c=black:s=64x48:d=0.4', '-c:v', 'mpeg4'] },
+      { name: 'dvd.mpg', mime: 'video/mpeg', args: ['-f', 'lavfi', '-i', 'color=c=black:s=64x48:d=0.4', '-c:v', 'mpeg2video', '-f', 'mpeg'] },
+      { name: 'avchd.mts', mime: 'video/mp2t', args: ['-f', 'lavfi', '-i', 'color=c=black:s=64x48:d=0.4', '-c:v', 'mpeg2video', '-f', 'mpegts'] },
+      { name: 'home.mkv', mime: 'video/x-matroska', args: ['-f', 'lavfi', '-i', 'color=c=black:s=64x48:d=0.4', '-c:v', 'mpeg4', '-f', 'matroska'] },
+      { name: 'voice.aac', mime: 'audio/aac', args: ['-f', 'lavfi', '-i', 'sine=frequency=440:duration=0.4', '-c:a', 'aac', '-f', 'adts'] },
+    ];
+    for (const sample of samples) {
+      const path = join(generated, sample.name);
+      await execute(process.env.FFMPEG_PATH || 'ffmpeg', ['-nostdin', '-v', 'error', ...sample.args, '-y', path], { timeout: 15000 });
+      const upload = await send(await readFile(path), sample.name);
+      assert.equal(upload.status, 201, `${sample.name}: ${upload.body.error}`); assert.equal(upload.body.mime, sample.mime, sample.name);
+      assert.equal(upload.body.previewStatus, 'pending', sample.name);
+    }
+    await f.processMedia();
+    for (const record of f.store.all<{ name: string; previewStatus: string; previewError?: string }>('files')) assert.equal(record.previewStatus, 'ready', `${record.name}: ${record.previewError}`);
+
+    // A preview that cannot be prepared (here: longer than the configured limit) must not cost the original.
+    const long = join(generated, 'long.webm');
+    await execute(process.env.FFMPEG_PATH || 'ffmpeg', ['-nostdin', '-v', 'error', '-f', 'lavfi', '-i', 'sine=frequency=220:duration=3', '-c:a', 'libopus', '-y', long], { timeout: 15000 });
+    const bytes = await readFile(long);
+    const previous = process.env.MEDIA_MAX_DURATION_SECONDS; process.env.MEDIA_MAX_DURATION_SECONDS = '1';
+    try {
+      const upload = await send(bytes, 'long.webm');
+      assert.equal(upload.status, 201, upload.body.error ?? '');
+      await f.processMedia();
+      const record = f.store.get<{ path: string; previewStatus: string; previewError: string; sha256: string }>('files', upload.body.id)!;
+      assert.equal(record.previewStatus, 'failed'); assert.match(record.previewError, /Оригинал сохранён/);
+      assert.deepEqual(await readFile(join(f.store.filesDir, record.path)), bytes);
+      const served = await fetch(f.base + upload.body.url, { headers: { Cookie: f.admin.cookie } });
+      assert.equal(served.headers.get('content-type'), 'audio/webm'); assert.deepEqual(Buffer.from(await served.arrayBuffer()), bytes);
+      const state = await f.request('/api/conversations', f.admin.cookie, {});
+      const message = await f.request(`/api/conversations/${state.body.id}/messages`, f.admin.cookie, { id: randomUUID(), text: '', fileId: upload.body.id, version: state.body.version });
+      assert.equal(message.status, 202, JSON.stringify(message.body));
+      assert.equal(message.body.messages[0].file.previewStatus, 'failed');
+    } finally { if (previous === undefined) delete process.env.MEDIA_MAX_DURATION_SECONDS; else process.env.MEDIA_MAX_DURATION_SECONDS = previous; }
+
+    // Rejected content leaves nothing behind in files/ or its staging area.
+    assert.equal((await send(Buffer.from('<html><script>alert(1)</script></html>'), 'page.html')).status, 400);
+    const stored = new Set(f.store.all<{ path: string; previewPath?: string }>('files').flatMap(record => [record.path, record.previewPath].filter(Boolean)));
+    assert.deepEqual((await readdir(f.store.filesDir)).filter(name => !name.startsWith('.') && !stored.has(name)), []);
+    assert.deepEqual(await readdir(join(f.store.filesDir, '.incoming')), []);
   } finally { await f.cleanup(); await rm(generated, { recursive: true, force: true }); }
 });
 
@@ -216,4 +278,66 @@ test('real full dates reject impossible days while optional and approximate date
     assert.equal((await f.request(`/api/materials/${material.id}/proposals`, f.admin.cookie, { accept: [badProposal], reject: [], transcriptVersion: null })).status, 400);
     assert.ok(!f.store.all<Fact>('facts').some(item => item.key === 'deathDate'));
   } finally { await f.cleanup(); }
+});
+
+test('proposal review reuses an already mapped person and refuses two values for one fact', async () => {
+  const f = await fixture();
+  try {
+    const material = (await f.request('/api/materials', f.admin.cookie, { title: 'Repeated source', kind: 'story', body: 'Мария родилась в Туле. Мария жила в Туле.' })).body as Material;
+    const first = proposal('first', 'create_person', { personName: 'Мария', sourceQuote: 'Мария родилась в Туле.' });
+    f.store.put('materials', { ...material, proposals: [first] });
+    const created = await f.request(`/api/materials/${material.id}/proposals`, f.admin.cookie, { accept: [first], reject: [], transcriptVersion: null });
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    const maria = f.store.all<Person>('people')[0];
+    // Re-extraction mentions the same relative again; mapping it to the existing card is not a duplicate.
+    const again = proposal('again', 'create_person', { personName: 'Мария', sourceQuote: 'Мария жила в Туле.' });
+    const current = f.store.get<Material>('materials', material.id)!;
+    f.store.put('materials', { ...current, proposals: [...current.proposals!, again] });
+    const mapped = await f.request(`/api/materials/${material.id}/proposals`, f.admin.cookie, { accept: [{ ...again, personId: maria.id }], reject: [], transcriptVersion: null });
+    assert.equal(mapped.status, 200, JSON.stringify(mapped.body));
+    assert.equal(f.store.all('people').length, 1);
+    // Two accepted values for the same field must not silently overwrite each other.
+    const birth1920 = proposal('b1920', 'set_fact', { personId: maria.id, key: 'birthDate', value: '1920', sourceQuote: 'Мария родилась в Туле.' });
+    const birth1925 = proposal('b1925', 'set_fact', { personId: maria.id, key: 'birthDate', value: '1925', sourceQuote: 'Мария жила в Туле.' });
+    const latest = f.store.get<Material>('materials', material.id)!;
+    f.store.put('materials', { ...latest, proposals: [...latest.proposals!, birth1920, birth1925] });
+    assert.equal((await f.request(`/api/materials/${material.id}/proposals`, f.admin.cookie, { accept: [birth1920, birth1925], reject: [], transcriptVersion: null })).status, 409);
+    assert.equal(f.store.all<Fact>('facts').filter(fact => fact.key === 'birthDate').length, 0);
+    // A reviewer's correction is accepted but marked: the quote no longer proves the value verbatim.
+    const corrected = await f.request(`/api/materials/${material.id}/proposals`, f.admin.cookie, { accept: [{ ...birth1920, value: '1921' }], reject: [birth1925.id], transcriptVersion: null });
+    assert.equal(corrected.status, 200, JSON.stringify(corrected.body));
+    const fact = f.store.all<Fact>('facts').find(item => item.key === 'birthDate')!;
+    assert.equal(fact.value, '1921'); assert.equal(fact.sourceEdited, true); assert.equal(fact.sourceQuote, 'Мария родилась в Туле.');
+  } finally { await f.cleanup(); }
+});
+
+test('interrupted paid processing becomes an explicit error after restart instead of running again', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'family-space-restart-'));
+  try {
+    const first = createApp({ dataDir, devAuth: true, production: false, bindHost: '127.0.0.1', adminEmail: '', startWorker: false });
+    first.store.put('materials', { id: 'material', title: 'Synthetic', kind: 'audio', body: '', narrator: '', occurredAt: '', personIds: [], file: null, createdBy: 'admin', createdAt: '', updatedAt: '', version: 1, transcriptionStatus: 'processing', extractionStatus: 'idle', processingError: null });
+    first.store.put('jobs', { id: 'job', materialId: 'material', actorId: 'admin', type: 'transcribe', status: 'processing', sourceVersion: null, sourceHash: '', createdAt: '' });
+    first.store.put('files', { id: 'file', name: 'x', mime: 'video/x-msvideo', size: 1, url: '/api/files/file', createdBy: 'admin', path: 'missing', previewStatus: 'processing', previewAttempts: 3 });
+    await first.close();
+    const second = createApp({ dataDir, devAuth: true, production: false, bindHost: '127.0.0.1', adminEmail: '', startWorker: false });
+    try {
+      assert.equal(second.store.get<{ status: string }>('jobs', 'job')!.status, 'error');
+      const material = second.store.get<Material>('materials', 'material')!;
+      assert.equal(material.transcriptionStatus, 'error'); assert.match(material.processingError!, /вручную/);
+      // A conversion that kept crashing the process is given up after a bounded number of attempts.
+      assert.equal(second.store.get<{ previewStatus: string }>('files', 'file')!.previewStatus, 'failed');
+    } finally { await second.close(); }
+  } finally { await rm(dataDir, { recursive: true, force: true }); }
+});
+
+test('an oversized upload is refused clearly and leaves no partial bytes behind', async () => {
+  const previous = process.env.MAX_UPLOAD_MB; process.env.MAX_UPLOAD_MB = '1';
+  const f = await fixture();
+  try {
+    const data = new FormData(); data.append('file', new Blob([Buffer.alloc(3 * 1024 * 1024, 7)]), 'big.bin');
+    const response = await fetch(f.base + '/api/files', { method: 'POST', headers: { Cookie: f.admin.cookie, 'X-Requested-With': 'family-space' }, body: data });
+    assert.equal(response.status, 400); assert.match((await response.json() as { error: string }).error, /1 МБ/);
+    assert.deepEqual((await readdir(f.store.filesDir)).filter(name => name !== '.incoming'), []);
+    assert.deepEqual(await readdir(join(f.store.filesDir, '.incoming')).catch(() => []), []);
+  } finally { await f.cleanup(); if (previous === undefined) delete process.env.MAX_UPLOAD_MB; else process.env.MAX_UPLOAD_MB = previous; }
 });

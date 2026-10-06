@@ -9,12 +9,17 @@ space. It is not a shared multi-tenant service.
 - Development uses Vite middleware on the Express server; production serves `dist` from the same process. The default port is `4317`.
 - `DATA_DIR` contains `family.sqlite` and `files/`. Container deployments mount the parent at `/var/lib/family-space` and use `/var/lib/family-space/data`.
 - Run one application process per database, including during deployment replacement. Background jobs are not coordinated across replicas.
+- In production inside a container the server refuses to start when `DATA_DIR` lies on the container's writable layer (same device as `/`): a forgotten volume must fail loudly, not lose data at the next redeploy. `ALLOW_EPHEMERAL_DATA=1` exists only for throwaway checks. Every start logs the data location and record counts.
+- Nothing family-provided is hard-deleted by the application. People, facts, relations, materials, files and conversations have no delete endpoints; corrections create new versions and history keeps the previous ones.
+- Shutdown stops accepting connections, waits up to `SHUTDOWN_TIMEOUT_MS` for requests in flight (uploads included), then interrupts background work explicitly before closing the database.
 - Application data, files, backups and credentials stay outside the source repository. There are no seeded relatives or stories.
 - Shared API data types live in `shared/types.ts`. Server routes, not client-side affordances, enforce access and validation.
 
 ## HTTP and access boundaries
 
 API errors use `{error:string}`; successful responses return their direct value.
+`GET /api/health` is public and returns only `{ok, diskLow}` (503 when the database is unreadable).
+Local preview (`DEV_AUTH=1`) answers only requests addressed to `127.0.0.1`, `localhost` or `[::1]`.
 JSON mutations use `X-Requested-With: family-space`. The server checks origin and
 CSRF requirements for mutations, including multipart uploads. Session cookies
 are HttpOnly and SameSite=Lax, with Secure enabled in production.
@@ -36,6 +41,9 @@ fields to ordinary members.
 | `GET /api/auth/telegram/callback` | Validate and consume the one-use login flow |
 | `POST /api/auth/profile` | Save separate name parts and phone; Telegram applicant becomes pending, preapproved guest becomes active |
 | `POST /api/auth/logout` | Revoke the current session |
+| `POST /api/auth/logout-all` | Revoke every session of the current account |
+| `POST /api/users/:id/deactivate` | Admin closes an active member's access (`status: removed`) and revokes all their sessions; not self, not the last active admin; contributions and authorship stay |
+| `POST /api/users/:id/reactivate` | Admin restores a removed member to `active` |
 | `POST /api/users/:id/approve` | Admin approves a pending applicant with member/viewer role |
 | `POST /api/users/:id/reject` | Admin rejects an applicant |
 | `PATCH /api/users/:id` | Admin changes an eligible user's role; guest cannot become admin |
@@ -48,7 +56,9 @@ fields to ordinary members.
 Telegram uses Authorization Code flow, PKCE S256, state, nonce and signed
 ID-token verification against the expected issuer, audience and timestamps.
 Provider credentials are server-only. `ADMIN_TELEGRAM_ID` explicitly designates
-the owner before first login; an arbitrary first visitor never becomes admin.
+the owner before first login; an arbitrary first visitor never becomes admin. While the space
+has no active administrator, the designated owner's Telegram login creates or promotes the
+owner account; once an active administrator exists, logging in promotes nobody.
 A designated owner can bind to one eligible legacy administrator without changing
 authorship. A fresh owner is bootstrapped only when the user table is empty.
 
@@ -56,8 +66,9 @@ Guest links are stored as hashes. Previewing or opening a URL never consumes
 one; redemption is an explicit POST. A new link for an existing guest preserves
 that account's ID and role. Sessions last up to 365 days.
 
-`FAMILY_SURNAMES` precedes explicit structured surnames and previous-name facts
-in the public invitation summary, capped at five. Do not parse legacy full-name
+`FAMILY_SURNAMES` precedes explicit structured current surnames in the public
+invitation summary, capped at five. Previous (maiden) names are never shown
+publicly: they are a common answer to bank security questions. Do not parse legacy full-name
 strings or expose tree details before approval. Matching a profile to a tree
 person requires a human click, does not rewrite that person's facts and rejects
 cards already claimed by another account.
@@ -95,8 +106,8 @@ dates do not prevent creating a person with a name alone.
 
 | Endpoint | Contract |
 | --- | --- |
-| `POST /api/files` | Validated multipart upload in field `file`; configurable default limit 250 MB |
-| `GET /api/files/:id` | Authorized media access with range requests |
+| `POST /api/files` | Validated multipart upload in field `file`; configurable default limit 250 MB; 507 when free space would fall below `MIN_FREE_DISK_MB` |
+| `GET /api/files/:id` | Authorized media access with range requests; serves the browser copy when `previewStatus` is `ready`, otherwise the original |
 | `POST /api/materials` | Create story/photo/audio/video material; enforce file ownership and MIME consistency |
 | `GET /api/materials/:id` | Material with transcript and proposals |
 | `PATCH /api/materials/:id` | Author/admin edit with version check |
@@ -107,15 +118,30 @@ dates do not prevent creating a person with a name alone.
 | `GET /api/export` | Admin JSON export; original files require a full backup |
 
 Validate actual media format; do not serve uploaded HTML, SVG or executable
-content as media. Original files are immutable. Browser-compatible derivatives
-are prepared locally. Unpublished conversation files are owner/admin-only;
+content as media. Original files are immutable. Uploads stream into
+`files/.incoming` while hashed, are fsynced, recognised (magic bytes + ffprobe),
+renamed into `files/` with a directory fsync, and only then recorded with their
+`sha256`. The original is committed before any derivative exists and is never
+removed because a derivative failed. Browser-compatible derivatives are prepared
+locally by a background queue (`previewStatus`: `none`, `pending`,
+`processing`, `ready`, `failed` with a user-facing `previewError`); a conversion
+interrupted three times is marked failed instead of looping. Accepted formats
+include JPEG/PNG/GIF/WebP/AVIF/HEIC/TIFF/BMP photos, MP3/AAC/M4A/WAV/FLAC/Ogg/
+AIFF/AMR/WMA audio and MP4/MOV/3GP/WebM/MKV/AVI/MPEG-PS (VOB)/MPEG-TS (MTS)/
+WMV/FLV video. Uploads and preview results are recorded in history. Unpublished conversation files are owner/admin-only;
 explicit archival makes attached sources readable by the family.
 
 AI modules return transcription or proposals and never directly mutate people,
 facts or relationships. Quotes must be grounded in source text. Assistant
 responses cannot become sources. Ambiguous people require explicit resolution;
 accepted proposals retain the accepting user's authorship and start unconfirmed.
-Apply version conflicts and idempotency checks on the server. Partial extraction
+Apply version conflicts and idempotency checks on the server. Two accepted
+proposals may not set the same person/field in one batch. A proposal mapped to a
+person already resolved for the same name is not a conflict. When a reviewer
+changes a suggested value or field, or a person later edits a fact that carries a
+quote, the fact records `sourceEdited: true`: the quote no longer proves the
+value verbatim. Material processing jobs interrupted by a restart become
+explicit errors and are never re-run automatically. Partial extraction
 may expose a rejected count without discarding valid grounded suggestions.
 Stories themselves do not require factual verification.
 
@@ -126,11 +152,15 @@ Stories themselves do not require factual verification.
 | `GET /api/conversations` | Visible conversation summaries; author and admin access |
 | `POST /api/conversations` | Create conversation; writer required |
 | `GET /api/conversations/:id` | Conversation detail and processing status |
-| `POST /api/conversations/:id/messages` | Persist exactly one text or audio message before background work; client UUID is idempotent |
-| `PATCH /api/conversations/:id/messages/:messageId` | Edit last user message with version check and invalidate subsequent old reply |
+| `POST /api/conversations/:id/messages` | Persist exactly one text or audio message before background work; client UUID is idempotent; when the assistant is busy the message is still saved and the conversation returns `error` with a retryable `errorOperation` |
+| `PATCH /api/conversations/:id/messages/:messageId` | Edit last user message with version check and invalidate subsequent old reply; the previous wording and transcript are kept in history |
 | `POST /api/conversations/:id/retry` | Retry transcription/reply without inserting a duplicate message |
 | `POST /api/conversations/:id/prepare` | Save explicit archive snapshot and extract proposals; never directly write tree changes |
 | `POST /api/conversations/:id/archive` | Save a source snapshot without AI; reuse same-version snapshot |
+
+Administrators may read any conversation; only its author changes, retries,
+archives or prepares it. A paid transcription is kept even when the dialogue
+becomes too long for a reply.
 
 Statuses are `idle`, `responding`, `transcribing`, `preparing` and `error`.
 `errorOperation` identifies which action to retry. Run one operation per

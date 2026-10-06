@@ -1,9 +1,12 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent, type RefObject } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent, type MutableRefObject, type RefObject } from 'react';
 import { BookOpen, Camera, Check, ChevronRight, Clock3, FileAudio, Film, Image, Mic, Pencil, Plus, Search, FileText, ListChecks, Upload, X } from 'lucide-react';
 import { FACT_LABELS, type AppState, type HistoryEntry, type Material, type MaterialKind, type Proposal, type UploadedFile } from '../../shared/types';
 import { api, json, upload } from '../api';
-import { Avatar, formatDate, Modal } from './ui';
+import { Avatar, DraftNote, formatDate, Modal } from './ui';
 import Recorder from './Recorder';
+import { PreviewNote, mediaSrc, originalHref, previewFailed, previewPending } from './media';
+import { forgetRecording, recordingIdOf } from '../recording-store';
+import { clearDraft, draftKey, readDraft, useDraft } from '../drafts';
 import { FamilyDateField } from './PeopleForms';
 import ProposalReview from './ProposalReview';
 import { dateInputError, formatFamilyDate } from '../../shared/person-fields';
@@ -17,7 +20,11 @@ const kinds: Record<MaterialKind, { label: string; plural: string; Icon: typeof 
   video: { label: 'Видео', plural: 'Видео', Icon: Film },
 };
 const message = (error: unknown) => error instanceof Error ? error.message : 'Не удалось выполнить действие. Попробуйте ещё раз.';
-const fileUrl = (id: string) => `/api/files/${encodeURIComponent(id)}`;
+const photoAccept = 'image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,image/avif,image/tiff,image/bmp';
+const audioAccept = 'audio/*,.m4a,.ogg,.webm,.amr,.aiff,.aif,.wma';
+const videoAccept = 'video/*,.mts,.m2ts,.vob,.mpg,.avi,.wmv,.3gp,.mkv';
+interface MaterialDraft { kind: MaterialKind; title: string; body: string; narrator: string; occurredAt: string; personIds: string[] }
+const newMaterialDraftKey = (userId: string) => draftKey(userId, 'material', 'new');
 const busyStatus = (status: string) => status === 'queued' || status === 'processing';
 function timestamp(seconds: number) { return `${Math.floor(seconds / 60)}:${Math.floor(seconds % 60).toString().padStart(2, '0')}`; }
 function useUnsaved(dirty: boolean) {
@@ -40,6 +47,7 @@ export default function Archive({ state, onRefresh, initialPersonId, onPersonOpe
   const [createDirty, setCreateDirty] = useState(false);
   const [createBusy, setCreateBusy] = useState(false);
   const [notice, setNotice] = useState('');
+  const createWarning = useRef('');
   useEffect(() => setPersonId(initialPersonId || ''), [initialPersonId]);
   const entries = useMemo(() => buildArchiveEntries(state.materials), [state.materials]);
   const filtered = useMemo(() => entries.filter(entry => matchesArchiveEntry(entry, { query, kind, personId })), [entries, query, kind, personId]);
@@ -47,7 +55,8 @@ export default function Archive({ state, onRefresh, initialPersonId, onPersonOpe
   const hasFilters = !!query || kind !== 'all' || !!personId;
   const closeCreate = () => {
     if (createBusy) return;
-    if (createDirty && !window.confirm('Закрыть без сохранения? Введённый текст и запись будут потеряны.')) return;
+    // Text is kept as a draft and recordings stay on the device, so only warn about what would really be lost.
+    if (createDirty && createWarning.current && !window.confirm(createWarning.current)) return;
     setCreating(null); setCreateDirty(false);
   };
   return <section className="archive-page" aria-label="Семейный архив">
@@ -77,7 +86,7 @@ export default function Archive({ state, onRefresh, initialPersonId, onPersonOpe
       {!hasFilters && canAdd && <button className="archive-text-button" onClick={() => setCreating('audio')}><Mic size={16} /> Или записать разговор</button>}
     </div>}
     <Modal open={creating !== null} onClose={closeCreate} title="Добавить материал" wide>
-      {creating && <MaterialForm state={state} initialKind={creating} initialPersonId={personId} onDirtyChange={setCreateDirty} onBusyChange={setCreateBusy} onCancel={closeCreate} onSaved={async material => { setCreating(null); setCreateDirty(false); setNotice('Материал сохранён в семейном архиве.'); setSelectedId(material.id); await onRefresh(); }} />}
+      {creating && <MaterialForm state={state} initialKind={creating} initialPersonId={personId} closeWarning={createWarning} onDirtyChange={setCreateDirty} onBusyChange={setCreateBusy} onCancel={closeCreate} onSaved={async material => { setCreating(null); setCreateDirty(false); setNotice('Материал сохранён в семейном архиве.'); setSelectedId(material.id); await onRefresh(); }} />}
     </Modal>
     {selectedId && <MaterialDetail id={selectedId} state={state} onRefresh={onRefresh} onClose={() => setSelectedId(null)} onPersonOpen={onPersonOpen} />}
   </section>;
@@ -89,16 +98,22 @@ function MaterialCard({ entry, state, onOpen }: { entry: ArchiveEntry; state: Ap
   const people = state.people.filter(person => entry.personIds.includes(person.id));
   const firstRecording = attachments[0];
   const formatLabel = attachments.length ? entry.kinds.map(kind => kind === 'story' ? 'История' : kinds[kind].plural).join(' · ') : label;
+  const [coverFailed, setCoverFailed] = useState(false);
+  const coverSrc = material.file ? mediaSrc(material.file) : '';
+  useEffect(() => setCoverFailed(false), [coverSrc]);
+  const cover = (material.kind === 'photo' || material.kind === 'story') && material.file && !coverFailed ? material.file : null;
+  const noteFile = [material.file, firstRecording?.file].find(file => previewPending(file) || previewFailed(file));
   return <article className={`archive-card archive-card-${material.kind}`}>
     <button className="archive-card-cover" onClick={onOpen} aria-label={`Открыть: ${material.title}`}>
-      {(material.kind === 'photo' || material.kind === 'story') && material.file ? <img src={fileUrl(material.file.id)} alt={material.title} loading="lazy" /> : material.kind === 'story' ? <><BookOpen size={22} strokeWidth={1.5} /><p>{material.body || 'Семейная история'}</p></> : <><Icon size={36} strokeWidth={1.5} /><span>{label}</span></>}
+      {cover ? <img src={mediaSrc(cover)} alt={material.title} loading="lazy" onError={() => setCoverFailed(true)} /> : material.kind === 'story' && !material.file ? <><BookOpen size={22} strokeWidth={1.5} /><p>{material.body || 'Семейная история'}</p></> : <><Icon size={36} strokeWidth={1.5} /><span>{previewPending(material.file) ? 'Готовим версию для просмотра…' : label}</span></>}
     </button>
     <div className="archive-card-content">
       <div className="archive-card-meta"><span><Icon size={13} />{formatLabel}</span><time>{formatFamilyDate(material.occurredAt) || formatDate(material.createdAt)}</time></div>
       <button className="archive-card-title" onClick={onOpen}><h3>{material.title}</h3></button>
       {material.narrator && <p className="archive-card-narrator">Рассказывает {material.narrator}</p>}
-      {material.kind === 'audio' && material.file && <audio className="archive-card-player" controls preload="metadata" src={fileUrl(material.file.id)} aria-label={material.title} />}
-      {firstRecording?.file && (firstRecording.kind === 'video' ? <video className="archive-card-video-player" controls playsInline preload="metadata" src={fileUrl(firstRecording.file.id)} aria-label={`Запись: ${material.title}`} /> : <audio className="archive-card-player" controls preload="metadata" src={fileUrl(firstRecording.file.id)} aria-label={`Запись: ${material.title}`} />)}
+      {material.kind === 'audio' && material.file && <audio className="archive-card-player" controls preload="metadata" src={mediaSrc(material.file)} aria-label={material.title} />}
+      {firstRecording?.file && (firstRecording.kind === 'video' ? <video className="archive-card-video-player" controls playsInline preload="metadata" src={mediaSrc(firstRecording.file)} aria-label={`Запись: ${material.title}`} /> : <audio className="archive-card-player" controls preload="metadata" src={mediaSrc(firstRecording.file)} aria-label={`Запись: ${material.title}`} />)}
+      <PreviewNote file={noteFile} className="archive-card-preview-note" />
       {attachments.length > 1 && <button className="archive-text-button" onClick={onOpen}>Все записи · {attachments.length}<ChevronRight size={15} /></button>}
       <div className="archive-card-footer"><div className="archive-card-people">{people.slice(0, 3).map(person => <Avatar key={person.id} name={person.name} fileId={person.avatarFileId} size={25} />)}<span>{people.length === 1 ? people[0].name : people.length ? `${people.length} чел.` : 'Без привязки к людям'}</span></div><button className="icon-button" onClick={onOpen} aria-label={`Подробнее: ${material.title}`}><ChevronRight size={17} /></button></div>
     </div>
@@ -107,17 +122,27 @@ function MaterialCard({ entry, state, onOpen }: { entry: ArchiveEntry; state: Ap
 
 interface MaterialFormProps {
   state: AppState; material?: Material; initialKind?: MaterialKind; initialPersonId?: string;
+  /** Receives the question to ask before closing, or '' when closing loses nothing (text stays a draft). */
+  closeWarning?: MutableRefObject<string>;
   onDirtyChange: (dirty: boolean) => void; onBusyChange: (busy: boolean) => void;
   onCancel: () => void; onSaved: (material: Material) => Promise<void>;
 }
 
-function MaterialForm({ state, material, initialKind = 'story', initialPersonId, onDirtyChange, onBusyChange, onCancel, onSaved }: MaterialFormProps) {
-  const [kind, setKind] = useState<MaterialKind>(material?.kind || initialKind);
-  const [title, setTitle] = useState(material?.title || '');
-  const [body, setBody] = useState(material?.body || '');
-  const [narrator, setNarrator] = useState(material?.narrator || '');
-  const [occurredAt, setOccurredAt] = useState(formatFamilyDate(material?.occurredAt || ''));
-  const [personIds, setPersonIds] = useState<string[]>(material?.personIds || (initialPersonId ? [initialPersonId] : []));
+const draftIsEmpty = (value: MaterialDraft) => !value.title.trim() && !value.body.trim() && !value.narrator.trim() && !value.occurredAt.trim();
+
+function MaterialForm({ state, material, initialKind = 'story', initialPersonId, closeWarning, onDirtyChange, onBusyChange, onCancel, onSaved }: MaterialFormProps) {
+  // Only new materials keep a draft; edits of an existing material are compared with the server copy instead.
+  const storageKey = material ? null : newMaterialDraftKey(state.user.id);
+  const [restored] = useState(() => { const value = readDraft<MaterialDraft>(storageKey); return value && typeof value.title === 'string' && !draftIsEmpty(value) ? value : null; });
+  const [restoredNote, setRestoredNote] = useState(!!restored);
+  const defaultPeople = initialPersonId ? [initialPersonId] : [];
+  const restoredPeople = (restored?.personIds || []).filter(id => state.people.some(person => person.id === id));
+  const [kind, setKind] = useState<MaterialKind>(material?.kind || (restored && initialKind === 'story' && restored.kind in kinds ? restored.kind : initialKind));
+  const [title, setTitle] = useState(material?.title ?? restored?.title ?? '');
+  const [body, setBody] = useState(material?.body ?? restored?.body ?? '');
+  const [narrator, setNarrator] = useState(material?.narrator ?? restored?.narrator ?? '');
+  const [occurredAt, setOccurredAt] = useState(material ? formatFamilyDate(material.occurredAt || '') : restored?.occurredAt ?? '');
+  const [personIds, setPersonIds] = useState<string[]>(material?.personIds || (restoredPeople.length ? restoredPeople : defaultPeople));
   const [file, setFile] = useState<File | null>(null);
   const [uploaded, setUploaded] = useState<UploadedFile | null>(null);
   const [audioSource, setAudioSource] = useState<'file' | 'record'>('file');
@@ -125,8 +150,16 @@ function MaterialForm({ state, material, initialKind = 'story', initialPersonId,
   const [saving, setSaving] = useState(false);
   const [progress, setProgress] = useState<number | null>(null);
   const [error, setError] = useState('');
+  const uploadAbort = useRef<AbortController | null>(null);
+  const draft = useDraft<MaterialDraft>(storageKey, { kind, title, body, narrator, occurredAt, personIds }, draftIsEmpty);
   const baseline = useRef(JSON.stringify({ title, body, narrator, occurredAt, personIds, kind }));
-  const dirty = recording || !!file || baseline.current !== JSON.stringify({ title, body, narrator, occurredAt, personIds, kind });
+  const textDirty = baseline.current !== JSON.stringify({ title, body, narrator, occurredAt, personIds, kind });
+  const dirty = recording || !!file || textDirty;
+  const recorded = !!recordingIdOf(file);
+  const textKept = !!storageKey && !draft.failed;
+  if (closeWarning) closeWarning.current = recording ? 'Идёт запись. Закрыть форму? Запись остановится и останется на этом устройстве в списке несохранённых.'
+    : file ? `${recorded ? 'Закрыть форму? Запись останется на этом устройстве в списке несохранённых' : 'Закрыть форму? Выбранный файл нужно будет выбрать снова'}${textDirty ? textKept ? ', а текст — черновиком.' : ', а введённый текст будет потерян.' : '.'}`
+    : textDirty && !textKept ? 'Закрыть без сохранения? Введённый текст будет потерян.' : '';
   useUnsaved(dirty);
   useEffect(() => onDirtyChange(dirty), [dirty, onDirtyChange]);
   useEffect(() => onBusyChange(saving), [saving, onBusyChange]);
@@ -135,6 +168,13 @@ function MaterialForm({ state, material, initialKind = 'story', initialPersonId,
     if (next && next.size > state.settings.maxUploadMb * 1024 * 1024) setError(`Файл слишком большой. Максимум — ${state.settings.maxUploadMb} МБ.`);
     if (next && !title.trim()) setTitle(next.name.replace(/\.[^.]+$/, ''));
   }
+  function discardDraft() {
+    if (!window.confirm('Удалить восстановленный текст? Вернуть его будет нельзя.')) return;
+    draft.clear(); setRestoredNote(false);
+    setTitle(''); setBody(''); setNarrator(''); setOccurredAt(''); setPersonIds(defaultPeople);
+    baseline.current = JSON.stringify({ title: '', body: '', narrator: '', occurredAt: '', personIds: defaultPeople, kind });
+  }
+  const removedFromForm = recorded ? 'Запись уйдёт из формы, но останется на этом устройстве в списке несохранённых.' : 'Выбранный файл будет убран из формы.';
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (saving || recording) return;
@@ -144,43 +184,54 @@ function MaterialForm({ state, material, initialKind = 'story', initialPersonId,
     if (!material && kind !== 'story' && !file) { setError('Выберите файл или запишите разговор.'); return; }
     if (file && file.size > state.settings.maxUploadMb * 1024 * 1024) { setError(`Файл слишком большой. Максимум — ${state.settings.maxUploadMb} МБ.`); return; }
     setSaving(true);
+    const controller = new AbortController();
+    uploadAbort.current = controller;
     try {
       let attachment = uploaded;
-      if (file && !attachment) { setProgress(0); attachment = await upload(file, setProgress); setUploaded(attachment); setProgress(null); }
+      if (file && !attachment) { setProgress(0); attachment = await upload(file, { onProgress: setProgress, signal: controller.signal }); setUploaded(attachment); setProgress(null); }
       const fields = { title: title.trim(), body, narrator: narrator.trim(), occurredAt: occurredAt.trim(), personIds };
       const saved = material ? await api<Material>(`/api/materials/${material.id}`, json('PATCH', { ...fields, version: material.version })) : await api<Material>('/api/materials', json('POST', { ...fields, kind, fileId: attachment?.id }));
+      // The server confirmed the material: the draft and the device copy of the recording are no longer needed.
+      if (!material) { draft.clear(); clearDraft(storageKey); setRestoredNote(false); void forgetRecording(file); }
       baseline.current = JSON.stringify({ title, body, narrator, occurredAt, personIds, kind });
       setFile(null); onDirtyChange(false); onBusyChange(false);
       await onSaved(saved);
     } catch (cause) { setError(message(cause)); }
-    finally { setSaving(false); setProgress(null); }
+    finally { uploadAbort.current = null; setSaving(false); setProgress(null); }
   }
   return <form className="archive-form" onSubmit={submit}>
+    {restoredNote && <DraftNote onDiscard={discardDraft} onDismiss={() => setRestoredNote(false)} />}
     <fieldset disabled={saving}>
-      {!material && <div className="archive-format-choice" role="group" aria-label="Тип нового материала">{(Object.entries(kinds) as [MaterialKind, typeof kinds.story][]).map(([key, value]) => <button key={key} type="button" aria-pressed={key === kind} className={key === kind ? 'selected' : ''} disabled={recording} onClick={() => { if (kind === key) return; if (file && !window.confirm('Сменить тип материала? Выбранный файл будет убран из формы.')) return; setKind(key); setFile(null); setUploaded(null); }}><value.Icon size={20} />{value.label}</button>)}</div>}
+      {!material && <div className="archive-format-choice" role="group" aria-label="Тип нового материала">{(Object.entries(kinds) as [MaterialKind, typeof kinds.story][]).map(([key, value]) => <button key={key} type="button" aria-pressed={key === kind} className={key === kind ? 'selected' : ''} disabled={recording} onClick={() => { if (kind === key) return; if (file && !window.confirm(`Сменить тип материала? ${removedFromForm}`)) return; setKind(key); setFile(null); setUploaded(null); }}><value.Icon size={20} />{value.label}</button>)}</div>}
       <label className="field">Название<input autoFocus required maxLength={240} value={title} onChange={event => setTitle(event.target.value)} placeholder="Как назовём эту историю?" /></label>
       {!material && kind !== 'story' && <div className="archive-file-area">
-        {kind === 'audio' && <div className="archive-source-toggle" role="group" aria-label="Как добавить аудио"><button type="button" className={audioSource === 'file' ? 'selected' : ''} disabled={recording} onClick={() => { if (audioSource === 'file') return; if (audioSource === 'record' && file && !window.confirm('Перейти к загрузке файла? Запись будет убрана из формы.')) return; setAudioSource('file'); chooseFile(null); }}>Загрузить файл</button><button type="button" className={audioSource === 'record' ? 'selected' : ''} disabled={recording} onClick={() => { if (audioSource === 'record') return; if (audioSource === 'file' && file && !window.confirm('Перейти к диктофону? Выбранный файл будет убран из формы.')) return; setAudioSource('record'); chooseFile(null); }}>Записать сейчас</button></div>}
-        {kind === 'audio' && audioSource === 'record' ? <Recorder onRecorded={chooseFile} onActiveChange={setRecording} disabled={saving} /> : <label className="archive-upload"><Upload size={25} /><strong>{file ? file.name : 'Выберите файл'}</strong><span>{file ? `${(file.size / 1024 / 1024).toFixed(1)} МБ · нажмите, чтобы заменить` : `${kinds[kind].label} · до ${state.settings.maxUploadMb} МБ`}</span><input type="file" accept={kind === 'photo' ? 'image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,image/avif' : kind === 'audio' ? 'audio/*,.m4a,.ogg,.webm' : 'video/*'} onChange={event => chooseFile(event.target.files?.[0] || null)} /></label>}
+        {kind === 'audio' && <div className="archive-source-toggle" role="group" aria-label="Как добавить аудио"><button type="button" className={audioSource === 'file' ? 'selected' : ''} disabled={recording} onClick={() => { if (audioSource === 'file') return; if (audioSource === 'record' && file && !window.confirm(`Перейти к загрузке файла? ${removedFromForm}`)) return; setAudioSource('file'); chooseFile(null); }}>Загрузить файл</button><button type="button" className={audioSource === 'record' ? 'selected' : ''} disabled={recording} onClick={() => { if (audioSource === 'record') return; if (audioSource === 'file' && file && !window.confirm('Перейти к диктофону? Выбранный файл будет убран из формы.')) return; setAudioSource('record'); chooseFile(null); }}>Записать сейчас</button></div>}
+        {kind === 'audio' && audioSource === 'record' ? <Recorder onRecorded={chooseFile} onActiveChange={setRecording} disabled={saving} userId={state.user.id} context={`Архив · ${title.trim() || 'новый материал'}`} /> : <label className="archive-upload"><Upload size={25} /><strong>{file ? file.name : 'Выберите файл'}</strong><span>{file ? `${(file.size / 1024 / 1024).toFixed(1)} МБ · нажмите, чтобы заменить` : `${kinds[kind].label} · до ${state.settings.maxUploadMb} МБ`}</span><input type="file" accept={kind === 'photo' ? photoAccept : kind === 'audio' ? audioAccept : videoAccept} onChange={event => chooseFile(event.target.files?.[0] || null)} /></label>}
       </div>}
       <label className="field">{kind === 'story' ? 'История' : 'Описание'}<textarea rows={kind === 'story' ? 7 : 3} value={body} onChange={event => setBody(event.target.value)} placeholder={kind === 'story' ? 'Запишите, как всё было. Можно сохранить и совсем короткое воспоминание.' : 'Что происходит в записи или на фотографии? Необязательно.'} /></label>
-      {!material && kind === 'story' && <details className="archive-story-attachment"><summary><Camera size={16} />Добавить фотографию к истории</summary><label className="archive-upload"><Upload size={23} /><strong>{file?.name || 'Выберите фотографию'}</strong><span>Необязательно · до {state.settings.maxUploadMb} МБ</span><input type="file" accept="image/jpeg,image/png,image/webp,image/gif,image/heic,image/heif,image/avif" onChange={event => chooseFile(event.target.files?.[0] || null)} /></label>{file && <button type="button" className="archive-text-button" onClick={() => chooseFile(null)}><X size={14} />Убрать фотографию</button>}</details>}
+      {!material && kind === 'story' && <details className="archive-story-attachment"><summary><Camera size={16} />Добавить фотографию к истории</summary><label className="archive-upload"><Upload size={23} /><strong>{file?.name || 'Выберите фотографию'}</strong><span>Необязательно · до {state.settings.maxUploadMb} МБ</span><input type="file" accept={photoAccept} onChange={event => chooseFile(event.target.files?.[0] || null)} /></label>{file && <button type="button" className="archive-text-button" onClick={() => chooseFile(null)}><X size={14} />Убрать фотографию</button>}</details>}
       <div className="form-grid"><label className="field">Кто рассказывает <span className="muted">необязательно</span><input value={narrator} onChange={event => setNarrator(event.target.value)} maxLength={200} placeholder="Имя рассказчика" /></label><FamilyDateField label="Когда это было" value={occurredAt} onChange={setOccurredAt} /></div>
       {!!state.people.length && <fieldset className="archive-people-picker"><legend>Кто есть в этой истории <span className="muted">необязательно</span></legend><div>{state.people.map(person => <label key={person.id} className={personIds.includes(person.id) ? 'selected' : ''}><input type="checkbox" checked={personIds.includes(person.id)} onChange={event => setPersonIds(previous => event.target.checked ? [...previous, person.id] : previous.filter(id => id !== person.id))} /><Avatar name={person.name} fileId={person.avatarFileId} size={25} /><span>{person.name}</span></label>)}</div></fieldset>}
     </fieldset>
+    {draft.failed && <p className="draft-failed" role="status">Черновик не сохраняется на этом устройстве — не закрывайте форму, пока не сохраните материал.</p>}
     {error && <div className="archive-error" role="alert">{error}</div>}
-    {progress !== null && <div className="archive-upload-progress" role="status"><progress value={progress} max={100} /><span>{progress >= 100 ? 'Файл загружен. Подготавливаем для просмотра и прослушивания…' : `Загружаем файл: ${Math.round(progress)}%`}</span></div>}
-    <div className="archive-form-footer"><button type="button" className="button secondary" disabled={saving} onClick={onCancel}>Отмена</button><button type="submit" className="button primary" disabled={saving || recording}>{saving ? progress !== null ? progress >= 100 ? 'Подготавливаем…' : 'Загрузка…' : 'Сохраняем…' : material ? 'Сохранить изменения' : 'Сохранить материал'}</button></div>
+    {progress !== null && <div className="archive-upload-progress" role="status"><progress value={progress} max={100} /><span>{progress >= 100 ? 'Файл передан, сервер проверяет его — не закрывайте страницу.' : `Загружаем файл: ${Math.round(progress)}%`}</span><button type="button" className="archive-text-button" onClick={() => uploadAbort.current?.abort()}>Отменить загрузку</button></div>}
+    <div className="archive-form-footer"><button type="button" className="button secondary" disabled={saving} onClick={onCancel}>Отмена</button><button type="submit" className="button primary" disabled={saving || recording}>{saving ? progress !== null ? progress >= 100 ? 'Сервер проверяет файл…' : 'Загрузка…' : 'Сохраняем…' : material ? 'Сохранить изменения' : 'Сохранить материал'}</button></div>
   </form>;
 }
 
 function MediaDisplay({ material, mediaRef }: { material: Material; mediaRef: RefObject<HTMLMediaElement | null> }) {
   const [error, setError] = useState(false);
+  const src = material.file ? mediaSrc(material.file) : '';
+  useEffect(() => setError(false), [src]);
   if (!material.file) return null;
-  const src = fileUrl(material.file.id);
+  const image = material.kind === 'photo' || material.kind === 'story';
+  // While the browser copy is prepared (or when it failed) the preview note explains instead of a generic error.
+  const explained = previewPending(material.file) || previewFailed(material.file);
   return <div className={`archive-media archive-media-${material.kind}`}>
-    {(material.kind === 'photo' || material.kind === 'story') ? <img src={src} alt={material.title} onError={() => setError(true)} /> : material.kind === 'audio' ? <><div className="archive-audio-art"><Mic size={40} strokeWidth={1.2} /><span>Аудиозапись</span></div><audio ref={node => { mediaRef.current = node; }} controls preload="metadata" src={src} onError={() => setError(true)} aria-label={material.title} /></> : material.kind === 'video' ? <video ref={node => { mediaRef.current = node; }} controls playsInline preload="metadata" src={src} onError={() => setError(true)} aria-label={material.title} /> : null}
-    {error && <p className="archive-error" role="alert">Браузер не смог открыть этот формат. <a href={`${material.file.url}?original=1`} download={material.file.name}>Скачать оригинал</a> и открыть на устройстве.</p>}
+    {image ? !error && <img src={src} alt={material.title} onError={() => setError(true)} /> : material.kind === 'audio' ? <><div className="archive-audio-art"><Mic size={40} strokeWidth={1.2} /><span>Аудиозапись</span></div><audio ref={node => { mediaRef.current = node; }} controls preload="metadata" src={src} onError={() => setError(true)} aria-label={material.title} /></> : material.kind === 'video' ? <video ref={node => { mediaRef.current = node; }} controls playsInline preload="metadata" src={src} onError={() => setError(true)} aria-label={material.title} /> : null}
+    <PreviewNote file={material.file} />
+    {error && !explained && <p className="archive-error" role="alert">Браузер не смог открыть этот формат. <a href={originalHref(material.file)} download={material.file.name}>Скачать оригинал</a> и открыть на устройстве.</p>}
   </div>;
 }
 
@@ -194,6 +245,9 @@ export function MaterialDetail({ id, state, onRefresh, onClose, onPersonOpen, in
   const [saving, setSaving] = useState(false);
   const [transcriptEditing, setTranscriptEditing] = useState(false);
   const [transcriptText, setTranscriptText] = useState('');
+  const transcriptKey = draftKey(state.user.id, 'transcript', id);
+  const [storedTranscript, setStoredTranscript] = useState(() => readDraft<string>(transcriptKey));
+  const [transcriptRestored, setTranscriptRestored] = useState(false);
   const [proposalDirty, setProposalDirty] = useState(false);
   const [action, setAction] = useState('');
   const [notice, setNotice] = useState('');
@@ -202,6 +256,16 @@ export function MaterialDetail({ id, state, onRefresh, onClose, onPersonOpen, in
   const transcriptDirty = transcriptEditing && transcriptText !== (material?.transcript?.text || '');
   const dirty = editDirty || transcriptDirty || proposalDirty;
   useUnsaved(dirty);
+  const transcriptDraft = useDraft(transcriptEditing ? transcriptKey : null, transcriptText, value => value === (material?.transcript?.text || ''));
+  useEffect(() => { if (!transcriptEditing) setStoredTranscript(readDraft<string>(transcriptKey)); }, [transcriptEditing, transcriptKey]);
+  function openTranscriptEditor(useStored: boolean) {
+    const stored = useStored ? readDraft<string>(transcriptKey) : null;
+    setTranscriptText(stored ?? material?.transcript?.text ?? ''); setTranscriptRestored(stored !== null); setTranscriptEditing(true);
+  }
+  function closeTranscriptEditor() {
+    if (transcriptDirty && !window.confirm('Отменить исправления расшифровки? Черновик исправлений будет удалён.')) return;
+    transcriptDraft.clear(); clearDraft(transcriptKey); setTranscriptRestored(false); setTranscriptEditing(false);
+  }
   useEffect(() => {
     let cancelled = false;
     api<Material>(`/api/materials/${id}`).then(result => { if (!cancelled) setMaterial(result); }).catch(cause => { if (!cancelled) setError(message(cause)); });
@@ -253,6 +317,7 @@ export function MaterialDetail({ id, state, onRefresh, onClose, onPersonOpen, in
     setError(''); setAction('transcript');
     try {
       const next = await api<Material>(`/api/materials/${id}/transcript`, json('PATCH', { text: transcriptText, version: material.transcript?.version ?? 0 }));
+      transcriptDraft.clear(); clearDraft(transcriptKey); setTranscriptRestored(false);
       setMaterial(next); setTranscriptEditing(false); setProposalDirty(false);
       setNotice('Расшифровка сохранена. Ранее принятые сведения остались в дереве.'); await onRefresh();
     } catch (cause) { setError(message(cause)); }
@@ -272,6 +337,9 @@ export function MaterialDetail({ id, state, onRefresh, onClose, onPersonOpen, in
   const creator = material && state.users.find(user => user.id === material.createdBy);
   const entry = useMemo(() => material ? buildArchiveEntries([...state.materials.filter(item => item.id !== material.id), material]).find(item => item.material.id === material.id) : undefined, [material, state.materials]);
   const recordings = entry?.attachments || [];
+  // AppState is polled, so its copy of the file carries the latest preview status.
+  const stateFile = material && state.materials.find(item => item.id === material.id)?.file;
+  const shown = material && stateFile && material.file?.id === stateFile.id ? { ...material, file: stateFile } : material;
   if (recordingId) return <MaterialDetail key={recordingId} id={recordingId} state={state} onRefresh={onRefresh} onClose={() => setRecordingId(null)} onPersonOpen={id => { onClose(); onPersonOpen(id); }} />;
   return <Modal open onClose={close} title={editing ? 'Редактировать материал' : material?.title || 'Материал'} wide>
     {!material ? <div className="archive-detail-loading">{error ? <div className="archive-error" role="alert">{error}<button className="button secondary" onClick={() => { setError(''); void api<Material>(`/api/materials/${id}`).then(setMaterial).catch(cause => setError(message(cause))); }}>Попробовать снова</button></div> : <p className="muted" role="status">Открываем материал…</p>}</div> : editing ? <MaterialForm state={state} material={material} onDirtyChange={setEditDirty} onBusyChange={setSaving} onCancel={cancelEdit} onSaved={async saved => { setMaterial(saved); setEditing(false); setEditDirty(false); setNotice('Изменения сохранены.'); await onRefresh(); }} /> : <div className="archive-detail">
@@ -280,11 +348,12 @@ export function MaterialDetail({ id, state, onRefresh, onClose, onPersonOpen, in
       {error && <div className="archive-error" role="alert">{error}<button className="icon-button" onClick={() => setError('')} aria-label="Закрыть ошибку"><X size={16} /></button></div>}
       {hasProposalsView && <div className="archive-detail-tabs" role="tablist" aria-label="Материал и сведения"><button id="archive-material-tab" role="tab" aria-selected={view === 'material'} aria-controls="archive-material-panel" onClick={() => setView('material')}>Материал</button><button id="archive-proposals-tab" role="tab" aria-selected={view === 'proposals'} aria-controls="archive-proposals-panel" onClick={() => setView('proposals')}>Сведения для дерева{material.proposals?.some(item => item.status === 'pending') ? ` · ${material.proposals.filter(item => item.status === 'pending').length}` : ''}</button></div>}
       <div id="archive-material-panel" role="tabpanel" aria-labelledby={hasProposalsView ? 'archive-material-tab' : undefined} hidden={hasProposalsView && view !== 'material'}>
-      <MediaDisplay material={material} mediaRef={mediaRef} />
+      <MediaDisplay material={shown!} mediaRef={mediaRef} />
       {material.narrator && <p className="archive-narrator"><Mic size={17} />Рассказывает <strong>{material.narrator}</strong></p>}
       {!!recordings.length && <section className="archive-conversation-recordings"><h3>{recordings.length === 1 ? 'Запись разговора' : 'Записи разговора'}</h3>{recordings.map((item, index) => <div className="archive-recording" key={item.id}>
         {recordings.length > 1 && <strong>Запись {index + 1}</strong>}
-        {item.kind === 'video' ? <video controls playsInline preload="metadata" src={fileUrl(item.file!.id)} aria-label={`Запись ${index + 1}: ${material.title}`} /> : <audio controls preload="metadata" src={fileUrl(item.file!.id)} aria-label={`Запись ${index + 1}: ${material.title}`} />}
+        {item.kind === 'video' ? <video controls playsInline preload="metadata" src={mediaSrc(item.file!)} aria-label={`Запись ${index + 1}: ${material.title}`} /> : <audio controls preload="metadata" src={mediaSrc(item.file!)} aria-label={`Запись ${index + 1}: ${material.title}`} />}
+        <PreviewNote file={item.file} link={false} />
         <div className="archive-recording-actions"><a href={`${item.file!.url}?original=1`} download={item.file!.name}>Скачать оригинал</a><button className="archive-text-button" onClick={() => { if (dirty) { setError('Сначала сохраните или отмените изменения в этом материале.'); return; } setRecordingId(item.id); }}>Открыть запись отдельно</button></div>
       </div>)}</section>}
       {material.body && <>{!!recordings.length && <h3 className="archive-conversation-text-heading">Текст разговора</h3>}<div className={`archive-story-text ${material.kind === 'story' ? 'standalone' : ''}`}>{material.body}</div></>}
@@ -293,11 +362,12 @@ export function MaterialDetail({ id, state, onRefresh, onClose, onPersonOpen, in
 
       {(material.kind === 'audio' || material.kind === 'video' || material.transcript) && <section className="archive-detail-section">
         <div className="archive-section-heading"><h3>Расшифровка</h3>{material.transcript && <span className="badge">{material.transcript.automatic ? 'Автоматическая · возможны ошибки' : 'Исправлена человеком'}</span>}</div>
-        {transcriptEditing ? <div className="archive-transcript-editor"><label className="field">Текст расшифровки<textarea rows={12} value={transcriptText} onChange={event => setTranscriptText(event.target.value)} /></label><p className="muted">При сохранении непринятые предложения будут сброшены. Принятые сведения останутся в дереве.</p><div className="archive-inline-actions"><button className="button secondary" disabled={!!action} onClick={() => { if (!transcriptDirty || window.confirm('Отменить исправления расшифровки?')) setTranscriptEditing(false); }}>Отмена</button><button className="button primary" disabled={!!action || !transcriptText.trim()} onClick={() => void saveTranscript()}>{action === 'transcript' ? 'Сохраняем…' : 'Сохранить расшифровку'}</button></div></div> : material.transcript ? <>
+        {canEdit && !transcriptEditing && storedTranscript !== null && <p className="draft-pending" role="status">На этом устройстве есть несохранённое исправление расшифровки.</p>}
+        {transcriptEditing ? <div className="archive-transcript-editor">{transcriptRestored && <DraftNote onDiscard={() => { if (!window.confirm('Удалить несохранённое исправление расшифровки?')) return; transcriptDraft.clear(); clearDraft(transcriptKey); setTranscriptRestored(false); setTranscriptText(material.transcript?.text || ''); }} onDismiss={() => setTranscriptRestored(false)} />}<label className="field">Текст расшифровки<textarea rows={12} value={transcriptText} onChange={event => setTranscriptText(event.target.value)} /></label>{transcriptDraft.failed && <p className="draft-failed" role="status">Черновик не сохраняется на этом устройстве — сохраните расшифровку, прежде чем закрывать окно.</p>}<p className="muted">При сохранении непринятые предложения будут сброшены. Принятые сведения останутся в дереве.</p><div className="archive-inline-actions"><button className="button secondary" disabled={!!action} onClick={closeTranscriptEditor}>Отмена</button><button className="button primary" disabled={!!action || !transcriptText.trim()} onClick={() => void saveTranscript()}>{action === 'transcript' ? 'Сохраняем…' : 'Сохранить расшифровку'}</button></div></div> : material.transcript ? <>
           <div className="archive-transcript">{material.transcript.segments.length ? material.transcript.segments.map((segment, index) => <div key={index}><button className="archive-timestamp" onClick={() => seek(segment.start)} disabled={!material.file || material.kind === 'photo'}>{timestamp(segment.start)}</button><p>{segment.text}</p></div>) : <p>{material.transcript.text}</p>}</div>
-          {canEdit && <button className="archive-text-button" disabled={processing} onClick={() => { if (proposalDirty && !window.confirm('Отменить выбор предложений и исправить расшифровку?')) return; setProposalDirty(false); setTranscriptText(material.transcript?.text || ''); setTranscriptEditing(true); }}><Pencil size={14} />Исправить расшифровку</button>}
+          {canEdit && <button className="archive-text-button" disabled={processing} onClick={() => { if (proposalDirty && !window.confirm('Отменить выбор предложений и исправить расшифровку?')) return; setProposalDirty(false); openTranscriptEditor(true); }}><Pencil size={14} />{storedTranscript !== null ? 'Продолжить исправление расшифровки' : 'Исправить расшифровку'}</button>}
         </> : <p className="muted">Запись можно слушать и хранить без расшифровки. При желании добавьте текст вручную или создайте его из аудио.</p>}
-        {canEdit && !transcriptEditing && <div className="archive-inline-actions"><button className="button secondary" onClick={() => void process('transcribe')} disabled={!state.settings.aiAvailable || !!action || processing}><FileText size={16} />{busyStatus(material.transcriptionStatus) ? material.transcriptionStatus === 'queued' ? 'Ожидает расшифровки…' : 'Расшифровываем…' : material.transcriptionStatus === 'error' ? 'Повторить расшифровку' : material.transcript ? 'Расшифровать заново' : 'Создать расшифровку'}</button>{!material.transcript && <button className="archive-text-button" disabled={processing} onClick={() => { setTranscriptText(''); setTranscriptEditing(true); }}>Добавить текст вручную</button>}</div>}
+        {canEdit && !transcriptEditing && <div className="archive-inline-actions"><button className="button secondary" onClick={() => void process('transcribe')} disabled={!state.settings.aiAvailable || !!action || processing}><FileText size={16} />{busyStatus(material.transcriptionStatus) ? material.transcriptionStatus === 'queued' ? 'Ожидает расшифровки…' : 'Расшифровываем…' : material.transcriptionStatus === 'error' ? 'Повторить расшифровку' : material.transcript ? 'Расшифровать заново' : 'Создать расшифровку'}</button>{!material.transcript && <button className="archive-text-button" disabled={processing} onClick={() => openTranscriptEditor(true)}>{storedTranscript !== null ? 'Продолжить ввод текста' : 'Добавить текст вручную'}</button>}</div>}
         {canEdit && <p className="archive-processing-note">{state.settings.aiAvailable ? 'При запуске записи передаются в OpenAI для расшифровки. Текст и оригинал сохраняются в семейном архиве.' : 'Обработка записей ещё не подключена. Можно слушать оригинал и добавлять текст вручную.'}</p>}
       </section>}
 

@@ -9,20 +9,22 @@ import { createTelegramProvider, type TelegramProvider } from './telegram.js';
 import { Store, TABLES, type Table } from './store.js';
 import { isAiConfigured, transcribeFile, extractProposals } from './ai.js';
 import { registerConversations, ConversationError, type ConversationAI } from './conversations.js';
-import { prepareMedia, MediaError, type PreparedMedia } from './media.js';
-import type { User, Person, Fact, Relation, Reviewed, Material, UploadedFile, Invitation, InvitationLink, Proposal, FactKey, HistoryEntry, Transcript, NameParts } from '../shared/types.js';
+import { identifyMedia, createPreview, MediaError } from './media.js';
+import { startBackupScheduler, type BackupScheduler } from './backups.js';
+import { clientFile, commitUpload, DurableUploadStorage, previewReady, storageStatus, sweepIncoming, type FileRecord, type StoredUpload } from './files.js';
+import type { User, Person, Fact, Relation, Reviewed, Material, UploadedFile, Invitation, InvitationLink, Proposal, FactKey, HistoryEntry, Transcript, NameParts, BackupStatus } from '../shared/types.js';
 import { cleanNameParts, fullName, NAME_PART_MAX_LENGTH, dateInputError, formatFamilyDate, isDateFact } from '../shared/person-fields.js';
 
-type FileRecord = UploadedFile & { createdBy: string; path: string; previewPath?: string; previewMime?: string; previewSize?: number };
 type Session = { id: string; userId: string; expires: number };
 type Code = { id: string; name: string; hash: string; role: User['role']; expires: number; attempts: number; sentAt: number };
 type AuthFlow = { id: string; state: string; nonce: string; verifier: string; redirectUri: string; expires: number };
 type InvitationLinkRecord = InvitationLink & { tokenHash: string };
 type Job = { id: string; materialId: string; actorId: string; type: 'transcribe' | 'extract'; status: 'queued' | 'processing' | 'done' | 'error'; sourceVersion: number | null; sourceHash: string; createdAt: string; error?: string };
-type AppOptions = { telegramProvider?: TelegramProvider; adminTelegramId?: string; conversationAI?: Partial<ConversationAI>; dataDir?: string; bindHost?: string; devAuth?: boolean; production?: boolean; startWorker?: boolean; adminEmail?: string };
+type AppOptions = { telegramProvider?: TelegramProvider; adminTelegramId?: string; conversationAI?: Partial<ConversationAI>; dataDir?: string; bindHost?: string; devAuth?: boolean; production?: boolean; startWorker?: boolean; adminEmail?: string; minFreeDiskMb?: number; backupDir?: string };
 const now = () => new Date().toISOString();
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 const loopback = (host: string) => ['127.0.0.1', '::1', 'localhost', '::ffff:127.0.0.1'].includes(host);
+const loopbackHostHeader = (host = '') => /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(host);
 const factKey = z.enum(['name', 'previousName', 'birthDate', 'deathDate', 'place', 'bio']);
 const roleSchema = z.enum(['admin', 'member', 'viewer']);
 const relationSchema = z.object({ fromId: z.string().min(1), toId: z.string().min(1), type: z.enum(['parent', 'partner']), parentKind: z.enum(['biological', 'adoptive', 'unspecified']).default('unspecified'), source: z.string().max(5000).default('') });
@@ -54,6 +56,10 @@ export function createApp(options: AppOptions = {}) {
   const name = process.env.SPACE_NAME || 'Семейное пространство';
   const telegram = options.telegramProvider ?? createTelegramProvider();
   const adminTelegramId = (options.adminTelegramId ?? process.env.ADMIN_TELEGRAM_ID ?? '').trim();
+  const incoming = join(store.filesDir, '.incoming');
+  const minFreeBytes = Math.max(0, options.minFreeDiskMb ?? (Number(process.env.MIN_FREE_DISK_MB) || 1024)) * 1024 * 1024;
+  // Local preview trusts loopback sockets, so a rebound DNS name must not reach it through the browser.
+  if (devMode) app.use((req, res, next) => loopbackHostHeader(req.get('host')) ? next() : void res.status(421).json({ error: 'Локальный просмотр открывается только по адресу 127.0.0.1 или localhost.' }));
   app.use('/api', (_req, res, next) => { res.set('Cache-Control', 'no-store'); res.set('X-Content-Type-Options', 'nosniff'); res.set('Referrer-Policy', 'same-origin'); next(); });
   app.use('/api', (req, _res, next) => {
     if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
@@ -69,11 +75,12 @@ export function createApp(options: AppOptions = {}) {
   const writable = (user: User) => { if (user.role === 'viewer') fail(403, 'Наблюдатель может только смотреть.'); };
   const owned = (record: { createdBy: string }, user: User) => { writable(user); if (record.createdBy !== user.id && user.role !== 'admin') fail(403, 'Редактировать может автор или администратор.'); };
   const admin = (user: User) => { if (user.role !== 'admin') fail(403, 'Это действие доступно администратору.'); };
-  const clientFile = (record: FileRecord): UploadedFile => ({ id: record.id, name: record.name, mime: record.previewMime ?? record.mime, size: record.previewSize ?? record.size, url: record.url });
+  const freshFile = (file: UploadedFile | null) => { const record = file ? store.get<FileRecord>('files', file.id) : undefined; return record ? clientFile(record) : file; };
   const cookieValue = (req: Request, key: string) => req.headers.cookie?.split(';').map(x => x.trim()).find(x => x.startsWith(`${key}=`))?.slice(key.length + 1);
   const sessionId = (req: Request) => cookieValue(req, 'family_session');
   const previewRequest = (req: Request) => devMode && loopback(req.socket.remoteAddress || '');
   const active = (user: User) => !user.status || user.status === 'active';
+  const closedAccount = (user: User) => user.status === 'rejected' || user.status === 'removed';
   const sessionLifetime = 365 * 86400000;
   const sessionCookie = { httpOnly: true, sameSite: 'lax' as const, secure: production, path: '/' };
   const flowCookie = { httpOnly: true, sameSite: 'lax' as const, secure: production, path: '/api/auth/telegram' };
@@ -111,8 +118,8 @@ export function createApp(options: AppOptions = {}) {
   }
   const familySurnames = () => {
     const names = [...(process.env.FAMILY_SURNAMES || '').split(','),
-      ...store.all<Person>('people').map(person => person.nameParts?.lastName || ''),
-      ...store.all<Fact>('facts').filter(fact => fact.key === 'previousName').map(fact => fact.value)];
+      // Previous (maiden) names never reach the public invitation: they answer common security questions.
+      ...store.all<Person>('people').map(person => person.nameParts?.lastName || '')];
     const unique = new Map<string, string>();
     for (const raw of names) {
       const surname = raw.trim().replace(/\s+/g, ' ');
@@ -123,6 +130,11 @@ export function createApp(options: AppOptions = {}) {
     }
     return [...unique.values()];
   };
+  // Unauthenticated liveness: no family data, only whether storage answers.
+  app.get('/api/health', (_req, res) => {
+    try { store.db.prepare('SELECT 1').get(); res.json({ ok: true, diskLow: storageStatus(store.filesDir, minFreeBytes).low }); }
+    catch { res.status(503).json({ ok: false }); }
+  });
   app.get('/api/auth/config', (req, res) => res.json({ devMode: previewRequest(req), mailAvailable: false, telegramAvailable: telegram.configured, name, surnames: familySurnames() }));
   app.get('/api/auth/session', (req, res) => res.json({ user: sessionUser(req) ?? null }));
   app.post('/api/auth/telegram/start', async (req, res) => {
@@ -164,9 +176,10 @@ export function createApp(options: AppOptions = {}) {
           const legacy = users.filter(user => user.role === 'admin' && !user.telegramId && !user.telegramSubject && (user.email === 'admin@local.invalid' || (!!adminEmail && user.email === adminEmail)));
           if (legacy.length === 1) account = legacy[0];
         }
-        if (account) account = store.put('users', { ...account, telegramId: identity.telegramId, telegramSubject: identity.subject, authProvider: 'telegram' as const });
+        // The designated owner recovers administration only while the space has no active administrator.
+        const bootstrap = designatedAdmin && !users.some(user => user.role === 'admin' && active(user));
+        if (account) account = store.put('users', { ...account, telegramId: identity.telegramId, telegramSubject: identity.subject, authProvider: 'telegram' as const, ...(bootstrap ? { role: 'admin' as const, status: 'active' as const } : {}) });
         else {
-          const bootstrap = designatedAdmin && users.length === 0;
           account = store.put<User>('users', { id: randomUUID(), email: '', name: identity.name, role: bootstrap ? 'admin' : 'member', status: bootstrap ? 'active' : 'profile', authProvider: 'telegram', telegramId: identity.telegramId, telegramSubject: identity.subject, ...(identity.phone ? { phone: normalizePhone(identity.phone), phoneVerified: identity.phoneVerified } : {}) });
         }
         return newSession(account);
@@ -185,7 +198,7 @@ export function createApp(options: AppOptions = {}) {
       let account: User;
       if (link.userId) {
         account = get<User>('users', link.userId);
-        if (account.authProvider !== 'guest' || account.role === 'admin' || account.status === 'rejected') fail(410, 'Ссылка больше не действует. Попросите администратора прислать новую.');
+        if (account.authProvider !== 'guest' || account.role === 'admin' || closedAccount(account)) fail(410, 'Ссылка больше не действует. Попросите администратора прислать новую.');
       } else account = store.put<User>('users', { id: randomUUID(), name: '', email: '', role: link.role, status: 'profile', authProvider: 'guest', phoneVerified: false });
       store.put('invitation_links', { ...link, userId: account.id, usedAt: now(), uses: 1 });
       return { account, token: newSession(account) };
@@ -194,7 +207,7 @@ export function createApp(options: AppOptions = {}) {
   });
   app.post('/api/auth/profile', (req, res) => {
     const user = requireSession(req);
-    if (user.status === 'rejected') fail(403, 'Заявка отклонена. Обратитесь к администратору.');
+    if (closedAccount(user)) fail(403, user.status === 'removed' ? 'Доступ закрыт администратором.' : 'Заявка отклонена. Обратитесь к администратору.');
     const input = z.object({ nameParts: namePartsSchema.extend({ firstName: z.string().trim().min(1).max(NAME_PART_MAX_LENGTH), lastName: z.string().trim().min(1).max(NAME_PART_MAX_LENGTH) }), phone: z.string().trim().max(40) }).parse(req.body);
     const phone = normalizePhone(input.phone);
     const nameParts = cleanNameParts(input.nameParts);
@@ -236,21 +249,27 @@ export function createApp(options: AppOptions = {}) {
     });
     setSession(res, result.token); res.json(result.account);
   });
+  app.post('/api/auth/logout-all', (req, res) => {
+    const user = requireSession(req);
+    store.db.prepare("DELETE FROM sessions WHERE json_extract(data, '$.userId') = ?").run(user.id);
+    res.clearCookie('family_session', sessionCookie); res.json({ ok: true });
+  });
   app.post('/api/auth/logout', (req, res) => { const token = sessionId(req); if (token) store.delete('sessions', hash(token)); res.clearCookie('family_session', sessionCookie); res.json({ ok: true }); });
   app.use('/api', (req, res, next) => {
     const user = sessionUser(req);
     if (!user) return next(new ApiError(401, 'Войдите в семейное пространство.'));
-    if (!active(user)) return next(new ApiError(403, user.status === 'rejected' ? 'Заявка отклонена. Обратитесь к администратору.' : 'Доступ к семейному пространству откроется после одобрения администратора.'));
+    if (!active(user)) return next(new ApiError(403, user.status === 'removed' ? 'Доступ к семейному пространству закрыт администратором.' : user.status === 'rejected' ? 'Заявка отклонена. Обратитесь к администратору.' : 'Доступ к семейному пространству откроется после одобрения администратора.'));
     res.locals.user = user; next();
   });
   app.get('/api/state', (_req, res) => {
     const user = actor(res);
+    const operations = user.role === 'admin' ? { backup: backups?.status() ?? null, storage: storageStatus(store.filesDir, minFreeBytes) } : {};
     const users = store.all<User>('users').filter(item => user.role === 'admin' || active(item)).map(item => {
       if (user.role === 'admin' || item.id === user.id) return item;
       const { phone, phoneVerified, telegramId, telegramSubject, email, ...publicUser } = item;
       return { ...publicUser, email: '' };
     });
-    res.json({ user, users, people: store.all('people'), facts: store.all('facts'), relations: store.all('relations'), materials: store.all<Material>('materials').map(({ transcript, proposals, ...material }) => material), invitations: user.role === 'admin' ? store.all('invitations') : [], invitationLinks: user.role === 'admin' ? store.all<InvitationLinkRecord>('invitation_links').map(clientInvitationLink) : [], settings: { name, surnames: familySurnames(), devMode, aiAvailable: isAiConfigured(), maxUploadMb } });
+    res.json({ user, users, people: store.all('people'), facts: store.all('facts'), relations: store.all('relations'), materials: store.all<Material>('materials', "json_remove(data, '$.transcript', '$.proposals')").map(material => ({ ...material, file: freshFile(material.file) })), invitations: user.role === 'admin' ? store.all('invitations') : [], invitationLinks: user.role === 'admin' ? store.all<InvitationLinkRecord>('invitation_links').map(clientInvitationLink) : [], settings: { name, surnames: familySurnames(), devMode, aiAvailable: isAiConfigured(), maxUploadMb, ...operations } });
   });
   const reviewed = (user: User, source = '', extra: Partial<Reviewed> = {}): Reviewed => ({ id: randomUUID(), version: 1, status: 'unconfirmed', createdBy: user.id, updatedBy: user.id, createdAt: now(), updatedAt: now(), confirmedBy: null, confirmedAt: null, source, disputedBy: null, disputeNote: null, ...extra });
   const revised = <T extends Reviewed>(record: T, user: User, changes: Partial<T>): T => ({ ...record, ...changes, version: record.version + 1, updatedBy: user.id, updatedAt: now(), status: 'unconfirmed', confirmedBy: null, confirmedAt: null, disputedBy: null, disputeNote: null });
@@ -304,7 +323,7 @@ export function createApp(options: AppOptions = {}) {
     const user = actor(res); const before = get<Person>('people', String(req.params.id)); owned(before, user);
     const input = z.object({ avatarFileId: z.string().nullable() }).parse(req.body);
     if (input.avatarFileId) { const file = get<FileRecord>('files', input.avatarFileId); if (!file.mime.startsWith('image/')) fail(400, 'Для портрета нужна фотография.'); if (file.createdBy !== user.id && user.role !== 'admin') fail(403, 'Выберите загруженный вами файл.'); }
-    res.json(store.put('people', { ...before, ...input }));
+    res.json(store.transaction(() => { const after = store.put('people', { ...before, ...input }); store.history('people', after.id, user.id, 'edit', before, after); return after; }));
   });
   app.post('/api/facts', (req, res) => {
     const user = actor(res); writable(user);
@@ -316,7 +335,8 @@ export function createApp(options: AppOptions = {}) {
     const input = z.object({ value: textValue.optional(), nameParts: namePartsSchema.optional(), source: z.string().max(5000), version: versionSchema }).parse(req.body); const user = actor(res);
     res.json(store.transaction(() => {
       const before = get<Fact>('facts', String(req.params.id)); owned(before, user); requireVersion(before.version, input.version);
-      const after = store.put('facts', revised(before, user, { ...factFields(before.key, input.value, input.nameParts, before), source: input.source }));
+      const fields = factFields(before.key, input.value, input.nameParts, before);
+      const after = store.put('facts', revised(before, user, { ...fields, source: input.source, ...(before.sourceQuote && fields.value !== before.value ? { sourceEdited: true } : {}) }));
       syncName(after);
       store.history('facts', after.id, user.id, 'edit', before, after); return after;
     }));
@@ -339,10 +359,56 @@ export function createApp(options: AppOptions = {}) {
       store.history(kind, before.id, user.id, input.action, before, after); return after;
     }));
   });
-  app.get('/api/history/:kind/:id', (req, res) => { const kind = z.enum(['facts', 'relations', 'materials']).parse(req.params.kind); get(kind, String(req.params.id)); res.json(store.all<HistoryEntry>('history').filter(item => item.entityType === kind && item.entityId === req.params.id)); });
+  app.get('/api/history/:kind/:id', (req, res) => { const kind = z.enum(['facts', 'relations', 'materials', 'people']).parse(req.params.kind); get(kind, String(req.params.id)); res.json(store.where<HistoryEntry>('history', "json_extract(data, '$.entityType') = ? AND json_extract(data, '$.entityId') = ?", kind, String(req.params.id))); });
 
+  const mediaQueue = createMediaQueue();
+  let backups: BackupScheduler | null = null;
   // Archive routes and durable processing are registered below.
   return finishApp();
+
+  /** Browser copies are prepared one by one after the original is safe; the row records progress across restarts. */
+  function createMediaQueue() {
+    const concurrency = Math.min(4, Math.max(1, Number(process.env.MEDIA_PREVIEW_CONCURRENCY) || 1));
+    const running = new Set<Promise<void>>();
+    const controller = new AbortController();
+    let stopped = false;
+    const claim = () => store.transaction(() => {
+      const next = store.where<FileRecord>('files', "json_extract(data, '$.previewStatus') = 'pending'")[0];
+      return next ? store.put<FileRecord>('files', { ...next, previewStatus: 'processing', previewAttempts: (next.previewAttempts ?? 0) + 1, previewError: null }) : undefined;
+    });
+    async function run(file: FileRecord) {
+      try {
+        const preview = await createPreview(join(store.filesDir, file.path), controller.signal);
+        store.transaction(() => { const current = store.get<FileRecord>('files', file.id); if (current) store.put('files', { ...current, ...preview, previewStatus: 'ready', previewError: null }); });
+      } catch (error) {
+        const current = store.get<FileRecord>('files', file.id); if (!current) return;
+        if (controller.signal.aborted) store.put('files', { ...current, previewStatus: 'pending', previewAttempts: Math.max(0, (current.previewAttempts ?? 1) - 1) });
+        else store.put('files', { ...current, previewStatus: 'failed', previewError: error instanceof MediaError ? error.message : 'Не удалось подготовить версию для просмотра. Оригинал сохранён и доступен для скачивания.' });
+        if (!(error instanceof MediaError)) console.error('Preview failed:', error instanceof Error ? error.message : 'Unknown error');
+      }
+    }
+    function kick() {
+      try {
+        while (!stopped && running.size < concurrency) {
+          const file = claim(); if (!file) break;
+          const task: Promise<void> = run(file).catch(() => {}).finally(() => { running.delete(task); kick(); });
+          running.add(task);
+        }
+      } catch (error) { console.error('Preview queue failed:', error instanceof Error ? error.message : 'Unknown error'); }
+    }
+    return {
+      kick,
+      /** Tests and shutdown: wait until no preview is pending or running. */
+      async drain() { for (;;) { kick(); if (!running.size) return; await Promise.all([...running]); } },
+      async close() { stopped = true; controller.abort(); await Promise.all([...running]); },
+      // An interrupted conversion returns to the queue a bounded number of times, so one bad file cannot crash-loop the server.
+      recover() {
+        for (const file of store.where<FileRecord>('files', "json_extract(data, '$.previewStatus') = 'processing'")) {
+          store.put('files', (file.previewAttempts ?? 0) >= 3 ? { ...file, previewStatus: 'failed', previewError: 'Подготовка просмотра несколько раз прерывалась. Оригинал сохранён и доступен для скачивания.' } : { ...file, previewStatus: 'pending' });
+        }
+      },
+    };
+  }
 
   function finishApp() {
     registerArchive();
@@ -361,37 +427,76 @@ export function createApp(options: AppOptions = {}) {
       res.status(500).json({ error: 'Не удалось сохранить изменения. Попробуйте ещё раз.' });
     });
     let closed = false; let busy = false;
-    for (const job of store.all<Job>('jobs')) if (job.status === 'processing') store.put('jobs', { ...job, status: 'queued' });
+    // Like conversations, never repeat a paid request automatically after a restart: the person retries explicitly.
+    const interruption = 'Обработка прервана перезапуском сервера. Запустите её вручную.';
+    for (const job of store.where<Job>('jobs', "json_extract(data, '$.status') = 'processing'")) store.transaction(() => {
+      store.put('jobs', { ...job, status: 'error', error: interruption });
+      const field = job.type === 'transcribe' ? 'transcriptionStatus' : 'extractionStatus';
+      const material = store.get<Material>('materials', job.materialId);
+      if (material && ['queued', 'processing'].includes(material[field])) store.put('materials', { ...material, [field]: 'error', processingError: interruption });
+    });
+    store.db.prepare("DELETE FROM sessions WHERE json_extract(data, '$.expires') < ?").run(Date.now());
+    void sweepIncoming(incoming);
+    mediaQueue.recover();
+    if (options.startWorker !== false) mediaQueue.kick();
+    // Without BACKUP_DIR the scheduler only reports manual CLI backups from backup-status.json.
+    const setting = (key: string) => process.env[key]?.trim() ? Number(process.env[key]) : undefined;
+    const firstDelayMinutes = setting('BACKUP_FIRST_DELAY_MINUTES');
+    backups = startBackupScheduler({
+      dataDir: store.directory,
+      backupDir: options.startWorker === false ? options.backupDir : options.backupDir ?? (process.env.BACKUP_DIR?.trim() || undefined),
+      intervalHours: setting('BACKUP_INTERVAL_HOURS'), keep: setting('BACKUP_KEEP'),
+      firstDelayMs: firstDelayMinutes === undefined ? undefined : firstDelayMinutes * 60_000,
+    });
     async function processNextJob() {
-      if (busy || closed) return; const job = store.all<Job>('jobs').find(item => item.status === 'queued'); if (!job) return;
+      if (busy || closed) return; const job = store.where<Job>('jobs', "json_extract(data, '$.status') = 'queued'")[0]; if (!job) return;
       busy = true;
-      try { await runJob(job); } finally { busy = false; }
+      try { await runJob(job); }
+      catch (error) { store.put('jobs', { ...job, status: 'error', error: 'Не удалось обработать материал.' }); throw error; }
+      finally { busy = false; }
     }
     const timer = options.startWorker === false ? null : setInterval(() => { void processNextJob().catch(error => console.error('Processing failed:', error instanceof Error ? error.message : error)); }, 1000);
     timer?.unref();
-    return { app, store, processNextJob, close: async () => { closed = true; conversations.close(); if (timer) clearInterval(timer); while (busy) await new Promise(resolve => setTimeout(resolve, 20)); store.close(); } };
+    return { app, store, processNextJob, processMedia: () => mediaQueue.drain(), close: async () => { closed = true; conversations.close(); if (timer) clearInterval(timer); await mediaQueue.close(); await backups?.close(); while (busy) await new Promise(resolve => setTimeout(resolve, 20)); store.close(); } };
   }
 
   function registerArchive() {
-    const upload = multer({ dest: store.filesDir, limits: { fileSize: maxUploadMb * 1024 * 1024, files: 1, fields: 0 } });
-    app.post('/api/files', (_req, res, next) => { try { writable(actor(res)); next(); } catch (error) { next(error); } }, upload.single('file'), async (req, res) => {
-      const file = req.file; if (!file) fail(400, 'Выберите файл.');
-      let prepared: PreparedMedia | undefined;
+    const upload = multer({ storage: new DurableUploadStorage(incoming), defParamCharset: 'utf8', limits: { fileSize: maxUploadMb * 1024 * 1024, files: 1, fields: 0 } });
+    const acceptingUploads = (req: Request, res: Response, next: NextFunction) => {
       try {
-        prepared = await prepareMedia(file.path);
+        writable(actor(res));
+        const declared = Number(req.get('content-length')) || 0;
+        const disk = storageStatus(store.filesDir, minFreeBytes);
+        if (disk.freeBytes !== null && disk.freeBytes - declared < minFreeBytes) fail(507, 'На сервере заканчивается место. Файл не принят; сообщите администратору.');
+        next();
+      } catch (error) {
+        // Drain the unread body so the browser receives this message instead of a connection reset.
+        req.resume(); req.once('end', () => next(error)); req.once('error', () => next(error));
+      }
+    };
+    // The original is committed as soon as it is durable and recognised; browser copies follow in the background.
+    app.post('/api/files', acceptingUploads, upload.single('file'), async (req, res) => {
+      const file = req.file as StoredUpload | undefined; if (!file) fail(400, 'Выберите файл.');
+      let committed: string | undefined;
+      try {
+        const media = await identifyMedia(file.path);
+        committed = await commitUpload(file, store.filesDir);
         const id = randomUUID();
-        const record: FileRecord = { id, name: file.originalname.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 240) || 'Файл', ...prepared, size: file.size, url: `/api/files/${id}`, createdBy: actor(res).id, path: file.filename };
-        store.put('files', record); res.status(201).json(clientFile(record));
-      } catch (error) { await unlink(file.path).catch(() => {}); if (prepared?.previewPath) await unlink(join(store.filesDir, prepared.previewPath)).catch(() => {}); throw error; }
+        const record: FileRecord = { id, name: file.originalname.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 240) || 'Файл', mime: media.mime, size: file.size, sha256: file.sha256, url: `/api/files/${id}`, createdBy: actor(res).id, path: committed, createdAt: now(), previewStatus: media.needsPreview ? 'pending' : 'none', previewAttempts: 0 };
+        store.transaction(() => { store.put('files', record); store.history('files', id, record.createdBy, 'upload', null, { name: record.name, mime: record.mime, size: record.size, sha256: record.sha256 }); });
+        res.status(201).json(clientFile(record));
+        if (media.needsPreview) mediaQueue.kick();
+      } catch (error) { await unlink(committed ? join(store.filesDir, committed) : file.path).catch(() => {}); throw error; }
     });
     app.get(['/api/files/:id', '/api/files/:id/original'], (req, res, next) => {
       const file = get<FileRecord>('files', String(req.params.id));
       const account = actor(res);
+      // Indexed lookups: media players issue many range requests per playback.
       if (file.createdBy !== account.id && account.role !== 'admin' &&
-          !store.all<Material>('materials').some(m => m.file?.id === file.id) &&
-          !store.all<Person>('people').some(p => p.avatarFileId === file.id)) fail(404, 'Файл не найден.');
+          !store.exists('materials', "json_extract(data, '$.file.id') = ?", file.id) &&
+          !store.exists('people', "json_extract(data, '$.avatarFileId') = ?", file.id)) fail(404, 'Файл не найден.');
       const original = req.query.original === '1' || req.path.endsWith('/original');
-      const preview = !original && file.previewPath && file.previewMime && file.previewSize;
+      const preview = !original && previewReady(file);
       const size = preview ? file.previewSize! : file.size;
       const mime = preview ? file.previewMime! : file.mime;
       const filePath = preview ? file.previewPath! : file.path;
@@ -426,7 +531,7 @@ export function createApp(options: AppOptions = {}) {
         store.history('materials', record.id, user.id, 'create', null, record); return record;
       }); res.status(201).json(material);
     });
-    app.get('/api/materials/:id', (req, res) => res.json(get<Material>('materials', String(req.params.id))));
+    app.get('/api/materials/:id', (req, res) => { const material = get<Material>('materials', String(req.params.id)); res.json({ ...material, file: freshFile(material.file) }); });
     app.patch('/api/materials/:id', (req, res) => {
       const user = actor(res); const input = materialFields.partial().extend({ version: versionSchema }).parse(req.body);
       res.json(store.transaction(() => {
@@ -497,7 +602,9 @@ export function createApp(options: AppOptions = {}) {
           const personName = (item.nameParts ? fullName(item.nameParts) : item.personName?.trim()) || (item.personId ? get<Person>('people', item.personId).name : '');
           if (!personName) fail(400, 'Укажите имя нового человека.');
           const normalizedName = normalized(personName);
-          if (nameMap.has(normalizedName)) fail(409, 'Два предложения создают одинаковое имя. Выберите существующего человека или уточните имена.');
+          // The same name may already point to this very person (re-extraction, or two quotes about one relative).
+          const mapped = nameMap.get(normalizedName);
+          if (mapped && mapped !== item.personId) fail(409, 'Два предложения создают одинаковое имя. Выберите существующего человека или уточните имена.');
           const person = item.personId ? get<Person>('people', item.personId) : newPerson(user, personName, before.title, provenance(item), item.nameParts);
           if (!item.personId) createdPeople.add(person.id);
           nameMap.set(normalizedName, person.id);
@@ -505,26 +612,31 @@ export function createApp(options: AppOptions = {}) {
           if (originalName && !nameMap.has(normalized(originalName))) nameMap.set(normalized(originalName), person.id);
           item.personId = person.id; item.personName = personName; if (item.nameParts) item.nameParts = cleanNameParts(item.nameParts); links.add(person.id);
         }
+        const factTargets = new Set<string>();
         for (const item of accepted) {
           if (item.action === 'create_person') continue;
           if (item.action === 'set_fact') {
             const personId = resolve(item.personId, item.personName); item.personId = personId;
             const key = factKey.parse(item.key);
+            if (factTargets.has(`${personId}:${key}`)) fail(409, 'Два выбранных предложения меняют одно и то же сведение. Оставьте одно из них.');
+            factTargets.add(`${personId}:${key}`);
             const current = store.all<Fact>('facts').find(fact => fact.personId === personId && fact.key === key);
             const fields = factFields(key, item.value ?? undefined, item.nameParts, current); item.value = fields.value; item.nameParts = fields.nameParts;
             const original = originalFor(item);
+            // A reviewer may correct a suggestion; the quote then no longer proves the stored value verbatim.
+            const sourceEdited = original.key !== key || normalized(original.value ?? '') !== normalized(fields.value);
             if (current) {
               owned(current, user);
               // Resolving an ambiguous name or deliberately selecting another field uses
               // the version the user just reviewed; the original target cannot rebase itself.
               const expectedVersion = original.personId === personId && original.key === key ? original.baseVersion : item.baseVersion;
               if (!createdPeople.has(personId) && expectedVersion !== current.version) fail(409, 'Сведение уже изменилось. Проверьте текущую запись и запросите предложения заново.');
-              const after = store.put('facts', revised(current, user, { ...fields, source: before.title, ...provenance(item) }));
+              const after = store.put('facts', revised(current, user, { ...fields, source: before.title, ...provenance(item), sourceEdited }));
               syncName(after);
               store.history('facts', after.id, user.id, 'accept_proposal', current, after);
             } else {
               if (original.personId === personId && original.key === key && original.baseVersion !== null) fail(409, 'Исходное сведение изменилось. Запросите предложения заново.');
-              newFact(user, personId, key, fields.value, before.title, provenance(item), fields.nameParts);
+              newFact(user, personId, key, fields.value, before.title, { ...provenance(item), sourceEdited }, fields.nameParts);
             }
             links.add(personId);
           } else if (item.action === 'create_relation') {
@@ -540,11 +652,13 @@ export function createApp(options: AppOptions = {}) {
     });
   }
   function registerAdministration() {
+    // Authority changes are audited without copying contact details into history.
+    const audit = (actorId: string, before: User, after: User, action: string) => store.history('users', after.id, actorId, action, { role: before.role, status: before.status ?? 'active' }, { role: after.role, status: after.status ?? 'active' });
     app.post('/api/guest-links', (req, res) => {
       const user = actor(res); admin(user);
       const input = z.object({ role: z.enum(['member', 'viewer']).default('member'), userId: z.string().min(1).optional() }).parse(req.body ?? {});
       const target = input.userId ? get<User>('users', input.userId) : undefined;
-      if (target && (target.authProvider !== 'guest' || target.role === 'admin' || target.status === 'rejected')) fail(400, 'Гостевую ссылку можно создать только для гостя без прав администратора.');
+      if (target && (target.authProvider !== 'guest' || target.role === 'admin' || closedAccount(target))) fail(400, 'Гостевую ссылку можно создать только для гостя без прав администратора.');
       const token = randomBytes(32).toString('hex');
       const invitation = store.put<InvitationLinkRecord>('invitation_links', { id: randomUUID(), role: target ? target.role as 'member' | 'viewer' : input.role, createdBy: user.id, createdAt: now(), expiresAt: new Date(Date.now() + 7 * 86400000).toISOString(), revokedAt: null, uses: 0, userId: target?.id ?? null, usedAt: null, tokenHash: hash(token) });
       res.status(201).json({ invitation: clientInvitationLink(invitation), token });
@@ -560,7 +674,7 @@ export function createApp(options: AppOptions = {}) {
       res.json(store.transaction(() => {
         const user = get<User>('users', String(req.params.id));
         if (user.status !== 'pending' || !user.nameParts?.firstName || !user.nameParts.lastName || !user.phone) fail(409, 'Одобрить можно заявку с заполненными ФИО и телефоном.');
-        return store.put('users', { ...user, role, status: 'active' as const });
+        const after = store.put('users', { ...user, role, status: 'active' as const }); audit(actor(res).id, user, after, 'approve'); return after;
       }));
     });
     app.post('/api/users/:id/reject', (req, res) => {
@@ -568,7 +682,28 @@ export function createApp(options: AppOptions = {}) {
       res.json(store.transaction(() => {
         const user = get<User>('users', String(req.params.id));
         if (!['profile', 'pending'].includes(user.status || '')) fail(409, 'Отклонить можно только новую заявку.');
-        return store.put('users', { ...user, status: 'rejected' as const });
+        const after = store.put('users', { ...user, status: 'rejected' as const }); audit(actor(res).id, user, after, 'reject'); return after;
+      }));
+    });
+    // Closing access keeps every contribution and its authorship; it only ends sign-in on all devices.
+    app.post('/api/users/:id/deactivate', (req, res) => {
+      const actingAdmin = actor(res); admin(actingAdmin);
+      res.json(store.transaction(() => {
+        const user = get<User>('users', String(req.params.id));
+        if (user.id === actingAdmin.id) fail(409, 'Нельзя закрыть доступ самому себе.');
+        if (!active(user)) fail(409, 'Закрыть доступ можно только активному участнику.');
+        if (user.role === 'admin' && store.all<User>('users').filter(item => item.role === 'admin' && active(item)).length === 1) fail(409, 'В пространстве должен остаться хотя бы один администратор.');
+        const after = store.put('users', { ...user, status: 'removed' as const });
+        store.db.prepare("DELETE FROM sessions WHERE json_extract(data, '$.userId') = ?").run(user.id);
+        audit(actor(res).id, user, after, 'deactivate'); return after;
+      }));
+    });
+    app.post('/api/users/:id/reactivate', (req, res) => {
+      admin(actor(res));
+      res.json(store.transaction(() => {
+        const user = get<User>('users', String(req.params.id));
+        if (user.status !== 'removed') fail(409, 'Вернуть доступ можно участнику, у которого он был закрыт.');
+        const after = store.put('users', { ...user, status: 'active' as const }); audit(actor(res).id, user, after, 'reactivate'); return after;
       }));
     });
     app.patch('/api/me/person', (req, res) => {
@@ -595,7 +730,7 @@ export function createApp(options: AppOptions = {}) {
         if (!active(user)) fail(409, 'Сначала рассмотрите заявку участника.');
         if (user.authProvider === 'guest' && input.role === 'admin') fail(400, 'Гость не может быть администратором. Для этой роли нужен вход через Telegram.');
         if (user.role === 'admin' && input.role !== 'admin' && store.all<User>('users').filter(item => item.role === 'admin' && active(item)).length === 1) fail(409, 'В пространстве должен остаться хотя бы один администратор.');
-        return store.put('users', { ...user, role: input.role });
+        const after = store.put('users', { ...user, role: input.role }); audit(actor(res).id, user, after, 'role'); return after;
       }));
     });
     app.get('/api/export', (_req, res) => {

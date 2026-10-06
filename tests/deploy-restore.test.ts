@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
 import { execFile } from 'node:child_process';
-import { mkdtemp, lstat, rm } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdtemp, lstat, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -13,6 +14,13 @@ const runFile = promisify(execFile);
 const backupScript = fileURLToPath(new URL('../scripts/backup.mjs', import.meta.url));
 const restoreScript = fileURLToPath(new URL('../scripts/restore.mjs', import.meta.url));
 const localAdmin = { id: 'admin-preserved-id', name: 'Администратор', email: 'admin@local.invalid', role: 'admin' };
+// Synthetic media bytes: one original with a recorded checksum and a browser preview, one legacy original without a checksum.
+const media = {
+  original: { path: '0123456789abcdef0123456789abcdef', bytes: Buffer.alloc(70_000, 'synthetic recording ') },
+  preview: { path: '0123456789abcdef0123456789abcdef.preview.mp3', bytes: Buffer.alloc(20_000, 'synthetic preview ') },
+  legacy: { path: 'fedcba9876543210fedcba9876543210', bytes: Buffer.alloc(5_000, 'synthetic scan ') },
+};
+const sha = (bytes: Buffer) => createHash('sha256').update(bytes).digest('hex');
 const readState = (directory: string) => {
   const db = new DatabaseSync(join(directory, 'family.sqlite'), { readOnly: true });
   try {
@@ -38,13 +46,21 @@ async function fixture(t: TestContext, occupiedEmail?: string) {
     store.put('codes', { id: localAdmin.email, name: localAdmin.name, hash: 'synthetic-code-hash', role: 'admin', expires: 9_999_999_999_999, attempts: 0, sentAt: 0 });
     store.put('auth_flows', { id: 'old-flow-hash', state: 'old-state', verifier: 'old-verifier', expires: 9_999_999_999_999 });
     store.put('invitation_links', { id: 'old-guest-link', tokenHash: 'synthetic-link-hash', role: 'member', revokedAt: null, uses: 0 });
+    for (const file of Object.values(media)) await writeFile(join(store.filesDir, file.path), file.bytes);
+    store.put('files', {
+      id: 'recording', name: 'Синтетическая запись.m4a', mime: 'audio/mp4', size: media.original.bytes.length, url: '/api/files/recording', createdBy: localAdmin.id,
+      path: media.original.path, sha256: sha(media.original.bytes), previewStatus: 'ready', previewPath: media.preview.path, previewMime: 'audio/mpeg',
+      previewSize: media.preview.bytes.length, previewSha256: sha(media.preview.bytes),
+    });
+    store.put('files', { id: 'scan', name: 'Синтетический скан.jpg', mime: 'image/jpeg', size: media.legacy.bytes.length, url: '/api/files/scan', createdBy: localAdmin.id, path: media.legacy.path });
   } finally { store.close(); }
   // No .env loader, inherited NODE_OPTIONS, live DATA_DIR, or provider credentials reach either CLI.
   const cli = (script: string, args: string[]) => runFile(process.execPath, [script, ...args], {
     cwd: directory, env: {}, timeout: 15_000, maxBuffer: 128_000,
   });
   const original = readState(source);
-  await cli(backupScript, ['--data-dir', source, '--out', snapshot]);
+  const backup = await cli(backupScript, ['--data-dir', source, '--out', snapshot]);
+  assert.match(backup.stdout, /Копия создана: .*Файлов: 3/);
   return { source, snapshot, target, original, cli };
 }
 
@@ -64,6 +80,9 @@ test('deployment restore changes only the copied admin email, preserves identity
   }
   assert.deepEqual(readState(f.source), f.original, 'the original database, including its email and login records, stays untouched');
   assert.deepEqual(readState(f.snapshot), f.original, 'the portable snapshot retains its original email and records');
+  assert.deepEqual((await readdir(join(f.target, 'files'))).sort(), Object.values(media).map(file => file.path).sort());
+  for (const file of Object.values(media)) assert.deepEqual(await readFile(join(f.target, 'files', file.path)), file.bytes, `${file.path} is restored byte for byte`);
+  assert.equal((await lstat(join(f.target, 'files', media.original.path))).mode & 0o777, 0o600);
 });
 
 test('deployment restore refuses an email belonging to another user before creating the destination', async t => {

@@ -1,16 +1,19 @@
 export type Role = 'admin' | 'member' | 'viewer';
-export interface User { id: string; name: string; email: string; role: Role; nameParts?: NameParts; phone?: string; phoneVerified?: boolean; telegramId?: string; telegramSubject?: string; authProvider?: 'telegram' | 'guest' | 'local'; status?: 'profile' | 'pending' | 'active' | 'rejected'; personId?: string | null }
+export interface User { id: string; name: string; email: string; role: Role; nameParts?: NameParts; phone?: string; phoneVerified?: boolean; telegramId?: string; telegramSubject?: string; authProvider?: 'telegram' | 'guest' | 'local'; status?: 'profile' | 'pending' | 'active' | 'rejected' | 'removed'; personId?: string | null }
 export type ReviewStatus = 'unconfirmed' | 'confirmed' | 'disputed';
 export type FactKey = 'name' | 'previousName' | 'birthDate' | 'deathDate' | 'place' | 'bio';
 export const FACT_LABELS: Record<FactKey, string> = { name: 'ФИО', previousName: 'Прежняя фамилия', birthDate: 'Дата рождения', deathDate: 'Дата смерти', place: 'Место', bio: 'О человеке' };
-export interface Reviewed { id: string; version: number; status: ReviewStatus; createdBy: string; updatedBy: string; createdAt: string; updatedAt: string; confirmedBy: string | null; confirmedAt: string | null; source: string; sourceMaterialId?: string | null; sourceQuote?: string | null; sourceStart?: number | null; disputeNote?: string | null; disputedBy?: string | null }
+export interface Reviewed { id: string; version: number; status: ReviewStatus; createdBy: string; updatedBy: string; createdAt: string; updatedAt: string; confirmedBy: string | null; confirmedAt: string | null; source: string; sourceMaterialId?: string | null; sourceQuote?: string | null; sourceStart?: number | null; sourceEdited?: boolean | null; disputeNote?: string | null; disputedBy?: string | null }
 export interface NameParts { firstName: string; lastName: string; patronymic: string }
 export interface Person { id: string; name: string; nameParts?: NameParts; avatarFileId: string | null; createdBy: string; createdAt: string }
 export interface Fact extends Reviewed { personId: string; key: FactKey; value: string; nameParts?: NameParts }
 export type RelationType = 'parent' | 'partner';
 export type ParentKind = 'biological' | 'adoptive' | 'unspecified';
 export interface Relation extends Reviewed { fromId: string; toId: string; type: RelationType; parentKind: ParentKind }
-export interface UploadedFile { id: string; name: string; mime: string; size: number; url: string }
+/** none: the original plays directly; pending/processing: a browser copy is being prepared in the background;
+ * ready: the browser copy is served by default; failed: only the preserved original is available. */
+export type PreviewStatus = 'none' | 'pending' | 'processing' | 'ready' | 'failed';
+export interface UploadedFile { id: string; name: string; mime: string; size: number; url: string; previewStatus?: PreviewStatus; previewError?: string | null }
 export interface TranscriptSegment { start: number; end: number; text: string }
 export interface Transcript { text: string; segments: TranscriptSegment[]; version: number; automatic: boolean; updatedAt: string }
 export type ProposalAction = 'create_person' | 'set_fact' | 'create_relation' | 'link_material';
@@ -22,7 +25,20 @@ export interface InvitationLink { id: string; role: 'member' | 'viewer'; created
 export interface CreatedInvitationLink { invitation: InvitationLink; token: string }
 export interface InvitationPreview { role: 'member' | 'viewer'; expiresAt: string }
 export interface HistoryEntry { id: string; entityType: string; entityId: string; actorId: string; action: string; before: string | null; after: string | null; createdAt: string }
-export interface AppState { user: User; users: User[]; people: Person[]; facts: Fact[]; relations: Relation[]; materials: Material[]; invitations: Invitation[]; invitationLinks?: InvitationLink[]; settings: { name: string; surnames?: string[]; devMode: boolean; aiAvailable: boolean; maxUploadMb: number } }
+export interface AppState { user: User; users: User[]; people: Person[]; facts: Fact[]; relations: Relation[]; materials: Material[]; invitations: Invitation[]; invitationLinks?: InvitationLink[]; settings: { name: string; surnames?: string[]; devMode: boolean; aiAvailable: boolean; maxUploadMb: number; backup?: BackupStatus | null; storage?: StorageStatus | null } }
+/** Admin-only operational view. `stale` means no complete backup within the expected interval. */
+export interface BackupStatus {
+  automatic: boolean;
+  intervalHours: number | null;
+  running: boolean;
+  lastAttemptAt: string | null;
+  lastSuccessAt: string | null;
+  lastResult: 'ok' | 'degraded' | 'failed' | null;
+  lastError: string | null;
+  problemFiles: number;
+  stale: boolean;
+}
+export interface StorageStatus { freeBytes: number | null; totalBytes: number | null; low: boolean }
 export interface AuthConfig { devMode: boolean; mailAvailable: boolean; name: string; surnames?: string[]; telegramAvailable?: boolean }
 export interface AuthSession { user: User | null }
 

@@ -15,11 +15,21 @@ services:
       TELEGRAM_CLIENT_ID: ${TELEGRAM_CLIENT_ID:-}
       TELEGRAM_CLIENT_SECRET: ${TELEGRAM_CLIENT_SECRET:-}
       TRUST_PROXY: "1"
+      # Local snapshots on the same volume, outside DATA_DIR. They do not replace an off-site copy (DEPLOYMENT.md, §6).
+      BACKUP_DIR: ${BACKUP_DIR:-/var/lib/family-space/backups}
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+      BACKUP_KEEP: ${BACKUP_KEEP:-7}
     ports:
       - "127.0.0.1:4317:4317"
     volumes:
       - family_data:/var/lib/family-space
-    stop_grace_period: 60s
+    # Covers the 50 s in-flight request drain (SHUTDOWN_TIMEOUT_MS) plus stopping a running backup.
+    stop_grace_period: 75s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
 volumes:
   family_data:

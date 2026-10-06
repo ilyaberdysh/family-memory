@@ -61,7 +61,23 @@
 .members-error { padding: 10px 12px; background: #fff6ec; border: 1px solid #f2d9d4; color: #aa3e32; border-radius: 8px; margin-top: 12px; font-size: 13px; line-height: 1.6; }
 .members-error p { margin: 0; }
 .members-error .members-text-button { margin-top: 3px; }
+.members-danger { color: #9b3a2f; }
+.members-danger:hover { color: #7c2a21; }
+.members-removed-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; padding: 10px 0; border-bottom: 1px solid #f4ebe3; }
+.members-removed-row:last-of-type { border-bottom: 0; }
+.members-removed-row > .members-error { flex-basis: 100%; }
+.members-removed-label { display: inline-block; padding: 1px 7px; border-radius: 6px; background: #f6ece6; color: #8a4d3f; font-size: 12px; font-weight: 500; }
+.members-server { padding: 16px 18px; border: 1px solid #efe4d8; border-radius: 13px; background: #fffdf9; }
+.members-server-flag { padding: 2px 8px; border-radius: 6px; background: #fff0e9; color: #a6372c !important; font-weight: 550; }
+.members-server dl { display: flex; flex-direction: column; gap: 6px; margin: 6px 0 0; }
+.members-server dl > div { display: grid; grid-template-columns: minmax(150px, max-content) 1fr; gap: 2px 16px; font-size: 14px; line-height: 1.6; }
+.members-server dt { color: #7d7266; }
+.members-server dd { margin: 0; color: #382e24; overflow-wrap: anywhere; }
+.members-server .is-problem dd { color: #a6372c; font-weight: 550; }
+.members-server-note { margin: 12px 0 0; padding: 9px 12px; border-radius: 9px; background: #fff4ef; color: #8f3a2b; font-size: 13px; line-height: 1.6; }
 @media (max-width: 759px) {
+  .members-server dl > div { grid-template-columns: 1fr; }
+  .members-server { padding: 14px; }
   .members-invite { padding: 16px; }
   .members-copy-link > .button { width: 100%; justify-content: center; }
   .members-copy-link input, .members-content select { font-size: 16px; }

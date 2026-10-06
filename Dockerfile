@@ -7,6 +7,7 @@ RUN npm ci --include=dev --include=optional \
 COPY tsconfig.json vite.config.ts index.html ./
 COPY shared ./shared
 COPY server ./server
+COPY scripts ./scripts
 COPY src ./src
 COPY public ./public
 COPY tests ./tests
@@ -25,9 +26,13 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/server ./server
 COPY --from=build /app/shared ./shared
-COPY scripts/backup.mjs scripts/restore.mjs ./scripts/
+# The in-app backup scheduler imports scripts/backup.mjs; restore and verify are operator tools.
+COPY scripts/backup.mjs scripts/restore.mjs scripts/verify.mjs ./scripts/
 USER node
 EXPOSE 4317
+# No VOLUME instruction: the app refuses to start when DATA_DIR is on the container's ephemeral layer,
+# so a forgotten persistent volume is caught instead of silently using an anonymous one.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:4317/api/auth/config').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-CMD ["npm", "start"]
+  CMD node -e "fetch('http://127.0.0.1:4317/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+# Run node directly: npm/sh do not forward SIGTERM, which would skip the graceful drain.
+CMD ["node_modules/.bin/tsx", "server/index.ts"]

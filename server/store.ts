@@ -17,8 +17,18 @@ export class Store {
     this.db.exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA synchronous=FULL;');
     for (const table of TABLES) this.db.exec(`CREATE TABLE IF NOT EXISTS ${table} (id TEXT PRIMARY KEY, data TEXT NOT NULL CHECK(json_valid(data)))`);
     this.db.exec("DROP INDEX IF EXISTS unique_email; CREATE UNIQUE INDEX IF NOT EXISTS unique_email ON users(json_extract(data, '$.email')) WHERE json_extract(data, '$.email') != ''; CREATE UNIQUE INDEX IF NOT EXISTS unique_telegram_subject ON users(json_extract(data, '$.telegramSubject')) WHERE json_extract(data, '$.telegramSubject') != ''; CREATE UNIQUE INDEX IF NOT EXISTS unique_telegram_id ON users(json_extract(data, '$.telegramId')) WHERE json_extract(data, '$.telegramId') != ''; CREATE UNIQUE INDEX IF NOT EXISTS unique_fact ON facts(json_extract(data, '$.personId'), json_extract(data, '$.key'));");
+    // Lookup indexes keep hot paths (media range requests, history, workers) independent of archive size.
+    this.db.exec("CREATE INDEX IF NOT EXISTS history_entity ON history(json_extract(data, '$.entityType'), json_extract(data, '$.entityId')); CREATE INDEX IF NOT EXISTS material_file ON materials(json_extract(data, '$.file.id')); CREATE INDEX IF NOT EXISTS person_avatar ON people(json_extract(data, '$.avatarFileId')); CREATE INDEX IF NOT EXISTS job_status ON jobs(json_extract(data, '$.status')); CREATE INDEX IF NOT EXISTS file_preview_status ON files(json_extract(data, '$.previewStatus')); CREATE INDEX IF NOT EXISTS session_user ON sessions(json_extract(data, '$.userId'));");
   }
-  all<T>(table: Table): T[] { return this.db.prepare(`SELECT data FROM ${table} ORDER BY rowid`).all().map(row => JSON.parse(row.data as string) as T); }
+  /** `projection` is a trusted SQL expression over `data`, e.g. json_remove(data, '$.transcript'). */
+  all<T>(table: Table, projection = 'data'): T[] { return this.db.prepare(`SELECT ${projection} AS data FROM ${table} ORDER BY rowid`).all().map(row => JSON.parse(row.data as string) as T); }
+  /** `condition` is trusted SQL; values are always bound parameters. */
+  where<T>(table: Table, condition: string, ...values: (string | number | null)[]): T[] {
+    return this.db.prepare(`SELECT data FROM ${table} WHERE ${condition} ORDER BY rowid`).all(...values).map(row => JSON.parse(row.data as string) as T);
+  }
+  exists(table: Table, condition: string, ...values: (string | number | null)[]): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM ${table} WHERE ${condition} LIMIT 1`).get(...values);
+  }
   get<T>(table: Table, id: string): T | undefined {
     const row = this.db.prepare(`SELECT data FROM ${table} WHERE id = ?`).get(id);
     return row ? JSON.parse(row.data as string) as T : undefined;

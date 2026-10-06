@@ -50,7 +50,6 @@ function errorFor(error: unknown): ConversationAiError {
 }
 
 function familyContext(input: ConversationInput): string {
-  const names = input.people.map(({ id, name }) => ({ id, name }));
   const corpus = conversationUserText(input.messages).normalize('NFC').toLocaleLowerCase('ru');
   const mentioned = new Set(input.people.filter(person => {
     const name = person.name.normalize('NFC').toLocaleLowerCase('ru').trim();
@@ -60,7 +59,8 @@ function familyContext(input: ConversationInput): string {
   const relevantIds = new Set([...mentioned, ...relations.flatMap(relation => [relation.fromId, relation.toId])]);
   const context = JSON.stringify({
     kind: 'existing_family_reference', accountDisplayName: input.user.name,
-    people: names,
+    // Only relatives the dialogue mentions (and their direct links) leave the server; the whole roster never does.
+    people: input.people.filter(person => relevantIds.has(person.id)).map(({ id, name }) => ({ id, name })),
     facts: input.facts.filter(fact => relevantIds.has(fact.personId)).map(({ personId, key, value, status }) => ({ personId, key, value, status })),
     relations: relations.map(({ fromId, toId, type, parentKind, status }) => ({ fromId, toId, type, parentKind, status })),
   });

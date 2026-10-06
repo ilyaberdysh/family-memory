@@ -42,7 +42,7 @@ async function fixture(options: { empty?: boolean; adminTelegramId?: string; pro
     const flow = await start();
     return request(`/api/auth/telegram/callback?state=${flow.state}&code=test`, flow.cookie);
   };
-  return { ...runtime, admin, adminCookie, request, session, start, telegram, exchanges: () => exchanges, setIdentity: (next: TelegramIdentity) => { identity = next; }, cleanup: async () => { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); await runtime.close(); await rm(dataDir, { recursive: true, force: true }); } };
+  return { ...runtime, base, admin, adminCookie, request, session, start, telegram, exchanges: () => exchanges, setIdentity: (next: TelegramIdentity) => { identity = next; }, cleanup: async () => { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); await runtime.close(); await rm(dataDir, { recursive: true, force: true }); } };
 }
 
 test('Telegram profile and pending sessions cannot reach family APIs; approval grants only selected role', async () => {
@@ -176,4 +176,60 @@ test('unknown first Telegram login is not admin and production email login is go
     assert.equal((await production.request('/api/auth/verify', '', { email: 'admin@local.invalid', code: '123456' })).status, 410);
     assert.equal((await production.request('/api/auth/config')).body.devMode, false);
   } finally { await production.cleanup(); }
+});
+
+test('closing access ends every session but keeps the account and its contributions', async () => {
+  const f = await fixture();
+  try {
+    const member: User = { id: 'member', name: 'Участник', email: '', role: 'member', status: 'active', authProvider: 'telegram' };
+    f.store.put('users', member);
+    const phone = f.session(member); const laptop = f.session(member);
+    const person = await f.request('/api/people', phone, { name: 'Синтетический человек' });
+    assert.equal(person.status, 201);
+    assert.equal((await f.request(`/api/users/${f.admin.id}/deactivate`, f.adminCookie, {})).status, 409);
+    const closed = await f.request(`/api/users/${member.id}/deactivate`, f.adminCookie, {});
+    assert.equal(closed.status, 200, JSON.stringify(closed.body)); assert.equal(closed.body.status, 'removed');
+    for (const cookie of [phone, laptop]) assert.equal((await f.request('/api/state', cookie)).status, 401);
+    const relogin = f.session(member);
+    const blocked = await f.request('/api/state', relogin);
+    assert.equal(blocked.status, 403); assert.match(blocked.body.error, /закрыт/);
+    assert.equal(f.store.get<{ createdBy: string }>('people', person.body.id)!.createdBy, member.id);
+    assert.equal((await f.request(`/api/users/${member.id}/reactivate`, f.adminCookie, {})).body.status, 'active');
+    assert.equal((await f.request('/api/state', relogin)).status, 200);
+    assert.deepEqual(f.store.all<{ entityId: string; action: string }>('history').filter(entry => entry.entityId === member.id).map(entry => entry.action), ['deactivate', 'reactivate']);
+    // "Sign out everywhere" ends this person's sessions only.
+    const other = f.session(member);
+    assert.equal((await f.request('/api/auth/logout-all', relogin, {})).status, 200);
+    assert.equal((await f.request('/api/state', other)).status, 401);
+    assert.equal((await f.request('/api/state', f.adminCookie)).status, 200);
+  } finally { await f.cleanup(); }
+});
+
+test('the designated owner recovers administration when an unknown visitor signed in first', async () => {
+  const f = await fixture({ empty: true, adminTelegramId: '200' });
+  try {
+    const stranger = await f.telegram({ subject: 'telegram:100', telegramId: '100' });
+    assert.equal((await f.request('/api/auth/session', stranger.cookie)).body.user.role, 'member');
+    const owner = await f.telegram({ subject: 'telegram:200', telegramId: '200' });
+    const user = (await f.request('/api/auth/session', owner.cookie)).body.user;
+    assert.equal(user.role, 'admin'); assert.equal(user.status, 'active');
+    // Once an active administrator exists, nobody else is promoted by logging in.
+    const strangerAgain = await f.telegram({ subject: 'telegram:100', telegramId: '100' });
+    assert.equal((await f.request('/api/auth/session', strangerAgain.cookie)).body.user.role, 'member');
+  } finally { await f.cleanup(); }
+});
+
+test('local preview refuses rebound host names and exposes only a minimal health check', async () => {
+  const f = await fixture();
+  try {
+    const { request: httpRequest } = await import('node:http');
+    const health = await f.request('/api/health');
+    assert.equal(health.status, 200); assert.deepEqual(Object.keys(health.body).sort(), ['diskLow', 'ok']);
+    const base = new URL(f.base);
+    const status = await new Promise<number>((resolve, reject) => {
+      const req = httpRequest({ host: base.hostname, port: base.port, path: '/api/auth/config', headers: { Host: `rebind.attacker.example:${base.port}` } }, res => { res.resume(); resolve(res.statusCode ?? 0); });
+      req.on('error', reject); req.end();
+    });
+    assert.equal(status, 421);
+  } finally { await f.cleanup(); }
 });

@@ -263,3 +263,35 @@ test('preparation failure preserves the completed reply and retry targets prepar
     assert.equal(f.store.all('people').length, 0);
   } finally { await f.cleanup(); }
 });
+
+test('a busy assistant never refuses a message; only the author changes or publishes a conversation', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const f = await fixture({ available: () => true, reply: async () => { await gate; return 'Спасибо, записал.'; } });
+  try {
+    assert.equal((await f.request('/api/invitations', f.admin.cookie, { email: 'teller@example.test', role: 'member' })).status, 201);
+    const teller = await f.login('teller@example.test');
+    const conversations = [];
+    for (let i = 0; i < 3; i++) conversations.push((await f.request('/api/conversations', teller.cookie, {})).body as Conversation);
+    for (const c of conversations.slice(0, 2)) assert.equal((await f.request(`/api/conversations/${c.id}/messages`, teller.cookie, { id: randomUUID(), text: 'Первая история', version: c.version })).status, 202);
+    const story = { id: randomUUID(), text: 'Бабушка рассказывала про дом у реки.', version: conversations[2].version };
+    const saved = await f.request(`/api/conversations/${conversations[2].id}/messages`, teller.cookie, story);
+    assert.equal(saved.status, 202, JSON.stringify(saved.body));
+    assert.equal(saved.body.status, 'error'); assert.equal(saved.body.errorOperation, 'responding'); assert.match(saved.body.error, /Сообщение сохранено/);
+    assert.equal(f.store.get<Conversation>('conversations', conversations[2].id)!.messages[0].text, story.text);
+    // Administrators can read but not alter or publish another member's private dialogue.
+    assert.equal((await f.request(`/api/conversations/${conversations[2].id}`, f.admin.cookie)).status, 200);
+    assert.equal((await f.request(`/api/conversations/${conversations[2].id}/archive`, f.admin.cookie, { version: saved.body.version })).status, 403);
+    release();
+    for (const c of conversations.slice(0, 2)) assert.equal((await f.waitIdle(c.id, teller.cookie)).status, 'idle');
+    const retried = await f.request(`/api/conversations/${conversations[2].id}/retry`, teller.cookie, { version: saved.body.version });
+    assert.equal(retried.status, 202, JSON.stringify(retried.body));
+    const done = await f.waitIdle(conversations[2].id, teller.cookie);
+    assert.equal(done.status, 'idle'); assert.equal(done.messages.at(-1)?.text, 'Спасибо, записал.');
+    // Correcting a message keeps the earlier wording in history.
+    const edited = await f.request(`/api/conversations/${done.id}/messages/${story.id}`, teller.cookie, { text: 'Бабушка рассказывала про дом у реки Оки.', version: done.version }, 'PATCH');
+    assert.equal(edited.status, 200, JSON.stringify(edited.body));
+    const history = f.store.all<{ entityId: string; action: string; before: string }>('history').filter(entry => entry.entityId === done.id);
+    assert.equal(history.length, 1); assert.equal(JSON.parse(history[0].before).text, story.text);
+  } finally { release(); await f.cleanup(); }
+});

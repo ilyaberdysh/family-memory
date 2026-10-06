@@ -6,9 +6,12 @@ import { dirname, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
 import { z } from 'zod';
-import { checkDatabase, digest, readManifest, regularFile, snapshotFiles } from './backup.mjs';
+import { checkDatabase, collectReferences, describeProblem, digest, readManifest, regularFile, unexplainedDifferences } from './backup.mjs';
 
-export async function restoreBackup(backupDirectory, destination, appStopped, adminEmail) {
+/** Problems recorded at backup time that leave files missing or damaged in the copy (recovered ones were replaced by intact earlier versions). */
+export const blockingProblems = manifest => manifest.problems.filter(problem => !problem.recovered);
+
+export async function restoreBackup(backupDirectory, destination, appStopped, adminEmail, allowProblems = false) {
   if (!appStopped) throw new Error('Сначала остановите приложение, затем укажите --app-stopped.');
   const nextEmail = adminEmail?.trim().toLowerCase();
   if (adminEmail !== undefined && (!z.email().safeParse(nextEmail).success || nextEmail.endsWith('.invalid'))) throw new Error('Укажите настоящий email администратора.');
@@ -16,22 +19,27 @@ export async function restoreBackup(backupDirectory, destination, appStopped, ad
   const source = await realpath(resolve(backupDirectory));
   const target = resolve(destination);
   const manifest = await readManifest(source);
+  const problems = blockingProblems(manifest);
+  if (problems.length && !allowProblems) {
+    const listed = problems.slice(0, 5).map(problem => problem.path ? `files/${problem.path}` : `запись ${problem.fileId}`).join(', ');
+    throw new Error(`Копия создана с проблемами (${problems.length}: ${listed}${problems.length > 5 ? ', …' : ''}). Добавьте --allow-problems, чтобы восстановить всё, что в ней сохранилось.`);
+  }
   const folder = await lstat(join(source, 'files'));
   if (!folder.isDirectory() || folder.isSymbolicLink()) throw new Error('Некорректный каталог файлов копии.');
   const entries = [{ ...manifest.database, relativePath: 'family.sqlite' }, ...manifest.files.map(entry => ({ ...entry, relativePath: join('files', entry.path) }))];
   // Validate all content before creating the destination.
   for (const entry of entries) {
     const path = join(source, entry.relativePath);
-    if ((await regularFile(path)).size !== entry.size || await digest(path) !== entry.sha256) throw new Error('Контрольная сумма или размер файла не совпадает. Восстановление отменено.');
+    const info = await regularFile(path).catch(() => { throw new Error(`В копии нет ${entry.relativePath}. Восстановление отменено.`); });
+    if (info.size !== entry.size || await digest(path) !== entry.sha256) throw new Error(`Контрольная сумма или размер ${entry.relativePath} не совпадает. Восстановление отменено.`);
   }
   const snapshot = new DatabaseSync(join(source, 'family.sqlite'), { readOnly: true });
   let localAdminId;
   try {
     checkDatabase(snapshot);
-    const referenced = snapshotFiles(snapshot);
-    if (referenced.size !== manifest.files.length || manifest.files.some(file => referenced.get(file.path) !== file.size)) {
-      throw new Error('Набор файлов не соответствует снимку базы данных.');
-    }
+    // Every difference between the database and the copied files must be a problem recorded at backup time.
+    const differences = unexplainedDifferences(collectReferences(snapshot), manifest);
+    if (differences.length) throw new Error(`Набор файлов не соответствует снимку базы данных: ${differences.slice(0, 5).join(', ')}${differences.length > 5 ? ', …' : ''}.`);
     if (nextEmail) {
       const accounts = snapshot.prepare('SELECT id, data FROM users').all().map(row => JSON.parse(row.data));
       const local = accounts.filter(user => user.email === 'admin@local.invalid' && user.role === 'admin');
@@ -98,7 +106,7 @@ export async function restoreBackup(backupDirectory, destination, appStopped, ad
       }
     } finally { restored.close(); }
     complete = true;
-    return { destination: target, files: manifest.files.length };
+    return { destination: target, files: manifest.files.length, problems, recovered: manifest.problems.filter(problem => problem.recovered) };
   } finally {
     if (!complete) await rm(target, { recursive: true, force: true });
   }
@@ -106,11 +114,17 @@ export async function restoreBackup(backupDirectory, destination, appStopped, ad
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   try {
-    const { values } = parseArgs({ options: { from: { type: 'string' }, to: { type: 'string' }, 'app-stopped': { type: 'boolean' }, 'admin-email': { type: 'string' }, help: { type: 'boolean' } } });
-    if (values.help) console.log('node scripts/restore.mjs --from /private/backups/copy --to /private/family-restored --app-stopped [--admin-email real@example.com]');
+    const { values } = parseArgs({ options: { from: { type: 'string' }, to: { type: 'string' }, 'app-stopped': { type: 'boolean' }, 'admin-email': { type: 'string' }, 'allow-problems': { type: 'boolean' }, help: { type: 'boolean' } } });
+    if (values.help) console.log('node scripts/restore.mjs --from /private/backups/copy --to /private/family-restored --app-stopped [--admin-email real@example.com] [--allow-problems]');
     else {
       if (!values.from || !values.to) throw new Error('Укажите --from и новый, ещё не существующий каталог --to.');
-      const result = await restoreBackup(values.from, values.to, values['app-stopped'], values['admin-email']);
+      const result = await restoreBackup(values.from, values.to, values['app-stopped'], values['admin-email'], values['allow-problems']);
+      if (result.problems.length) {
+        console.error(`ВНИМАНИЕ: восстановлено с проблемами, записанными при создании копии (${result.problems.length}):`);
+        for (const problem of result.problems) console.error(`  - ${describeProblem(problem)}`);
+        console.error('Эти файлы отсутствуют или повреждены в восстановленном каталоге. Поищите их целые версии в более ранних копиях.');
+      }
+      if (result.recovered.length) console.log(`Файлов, повреждённых в DATA_DIR на момент копии и восстановленных из прежних целых версий: ${result.recovered.length}.`);
       console.log(`Восстановлено: ${result.destination}. Файлов: ${result.files}. Укажите этот DATA_DIR перед запуском приложения. Потребуется повторный вход; незавершённую обработку запустите вручную.`);
     }
   } catch (error) { console.error(`Восстановление не выполнено: ${error.message}`); process.exitCode = 1; }

@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { Store } from './store.js';
 import { isAiConfigured, transcribeFile } from './ai.js';
 import { conversationUserText, prepareConversationProposals, streamConversationReply } from './conversation-ai.js';
+import { clientFile, type FileRecord } from './files.js';
 import type { Conversation, ConversationMessage, Fact, Material, Person, Proposal, Relation, TranscriptSegment, UploadedFile, User } from '../shared/types.js';
 
 export class ConversationError extends Error {
@@ -16,7 +17,6 @@ export interface ConversationAI {
   prepare: typeof prepareConversationProposals;
   transcribe: typeof transcribeFile;
 }
-type FileRecord = UploadedFile & { createdBy: string; path: string; previewMime?: string; previewSize?: number };
 type StoredMessage = ConversationMessage & { requestHash?: string; segments?: TranscriptSegment[] };
 type StoredConversation = Omit<Conversation, 'messages'> & { messages: StoredMessage[] };
 type ConversationMaterial = Material & { conversationId?: string; conversationVersion?: number; messageId?: string; messageHash?: string };
@@ -26,14 +26,15 @@ const active = (c: Conversation) => ['responding', 'transcribing', 'preparing'].
 const operation = (c: Conversation): Conversation['errorOperation'] => c.status === 'preparing' || c.status === 'transcribing' || c.status === 'responding' ? c.status : null;
 const versionSchema = z.object({ version: z.number().int().positive() });
 const failed = (status: number, message: string): never => { throw new ConversationError(status, message); };
-const clean = (c: StoredConversation): Conversation => ({ ...c, messages: c.messages.map(({ requestHash, segments, ...message }) => message) });
-const publicFile = (file: FileRecord): UploadedFile => ({ id: file.id, name: file.name, mime: file.previewMime ?? file.mime, size: file.previewSize ?? file.size, url: file.url });
 
 /** Registered after authentication/CSRF. No assistant operation can write people, facts, or relations. */
 export function registerConversations(app: Express, store: Store, overrides: Partial<ConversationAI> = {}) {
   const ai: ConversationAI = { available: isAiConfigured, reply: streamConversationReply, prepare: prepareConversationProposals, transcribe: transcribeFile, ...overrides };
   const operations = new Map<string, AbortController>();
   let closed = false;
+  // File snapshots in messages are refreshed on read, so a browser copy prepared later becomes visible.
+  const freshFile = (file: UploadedFile | null | undefined) => { const record = file ? store.get<FileRecord>('files', file.id) : undefined; return record ? clientFile(record) : file ?? null; };
+  const clean = (c: StoredConversation): Conversation => ({ ...c, messages: c.messages.map(({ requestHash, segments, ...message }) => ({ ...message, file: freshFile(message.file) })) });
   const save = (c: StoredConversation) => store.put('conversations', { ...c, updatedAt: now() });
   const get = (id: string) => store.get<StoredConversation>('conversations', id) ?? failed(404, 'Разговор не найден.');
   const user = (res: Response): User => res.locals.user as User;
@@ -41,13 +42,16 @@ export function registerConversations(app: Express, store: Store, overrides: Par
     const c = get(id);
     if (c.createdBy !== account.id && account.role !== 'admin') failed(404, 'Разговор не найден.');
     if (write && account.role === 'viewer') failed(403, 'Наблюдатель может только смотреть.');
+    // Administrators may read a private conversation, but only its author publishes or changes it.
+    if (write && c.createdBy !== account.id) failed(403, 'Изменять разговор и сохранять его в архив может только автор.');
     return c;
   };
   const idleVersion = (c: StoredConversation, version: number) => {
     if (c.version !== version) failed(409, 'Разговор уже изменился. Обновите его и попробуйте снова.');
     if (active(c)) failed(409, 'Дождитесь завершения текущей обработки.');
   };
-  const capacity = () => { if (operations.size >= 2) failed(429, 'Сейчас обрабатываются другие разговоры. Попробуйте через минуту.'); };
+  const busy = () => operations.size >= 2;
+  const capacity = () => { if (busy()) failed(429, 'Сейчас обрабатываются другие разговоры. Попробуйте через минуту.'); };
   const context = (c: StoredConversation, account: User) => ({ messages: clean(c).messages, user: account, people: store.all<Person>('people'), facts: store.all<Fact>('facts'), relations: store.all<Relation>('relations') });
   const lastUserIndex = (c: StoredConversation) => { for (let i = c.messages.length - 1; i >= 0; i--) if (c.messages[i].role === 'user') return i; return -1; };
   const interrupt = (c: StoredConversation) => {
@@ -106,6 +110,10 @@ export function registerConversations(app: Express, store: Store, overrides: Par
     operations.set(id, controller);
     void Promise.resolve().then(() => task(controller.signal)).catch(error => {
       if (closed) return;
+      try { recordFailure(id, error); } catch (failure) { console.error('Conversation state could not be saved:', failure instanceof Error ? failure.message : 'Unknown error'); }
+    }).finally(() => operations.delete(id));
+  }
+  function recordFailure(id: string, error: unknown) {
       const c = get(id);
       const message = error instanceof Error ? error.message.slice(0, 500) : 'Не удалось обработать разговор. Попробуйте ещё раз.';
       const next = { ...c, status: 'error' as const, error: message, errorOperation: operation(c), messages: c.messages.map((m, i) => c.status === 'responding' && m.role === 'assistant' && i > lastUserIndex(c) ? { ...m, interrupted: true } : m) };
@@ -114,7 +122,6 @@ export function registerConversations(app: Express, store: Store, overrides: Par
         const material = store.get<Material>('materials', c.materialId);
         if (material?.extractionStatus === 'processing') store.put('materials', { ...material, extractionStatus: 'error', processingError: message });
       }
-    }).finally(() => operations.delete(id));
   }
 
   async function reply(id: string, account: User, signal: AbortSignal) {
@@ -132,8 +139,10 @@ export function registerConversations(app: Express, store: Store, overrides: Par
       c = get(id);
       const text = result.text.trim();
       if (!text) throw new Error('В записи не удалось распознать речь. Можно написать рассказ вручную.');
-      if (conversationUserText(c.messages).length + text.length > 120000) throw new Error('Разговор слишком длинный. Сохраните запись в архив и начните новый разговор.');
+      // A paid transcript is kept even when the dialogue becomes too long for a reply.
+      const tooLong = conversationUserText(c.messages).length + text.length > 120000;
       c = save({ ...c, version: c.version + 1, messages: c.messages.map(m => m.id === pending.id ? { ...m, text, automatic: true, segments: result.segments } : m) });
+      if (tooLong) throw new Error('Расшифровка сохранена, но разговор стал слишком длинным для ответа ассистента. Сохраните его в архив и начните новый.');
     }
     const assistantId = randomUUID();
     c = save({ ...c, status: 'responding', messages: [...c.messages, { id: assistantId, role: 'assistant', text: '', createdAt: now() }] });
@@ -176,26 +185,35 @@ export function registerConversations(app: Express, store: Store, overrides: Par
       if (existing.requestHash !== requestHash) failed(409, 'Это сообщение уже сохранено с другим содержимым.');
       res.json(clean(c)); return;
     }
-    idleVersion(c, input.version); capacity();
+    idleVersion(c, input.version);
     if (!input.text && !input.fileId) failed(400, 'Напишите сообщение или добавьте голосовую запись.');
     if (c.messages.length >= 198 || conversationUserText(c.messages).length + input.text.length > 120000) failed(400, 'Разговор достаточно длинный. Сохраните его и начните новый.');
     const file = input.fileId ? store.get<FileRecord>('files', input.fileId) : null;
     if (input.fileId && (!file || (file.createdBy !== account.id && account.role !== 'admin'))) failed(404, 'Запись не найдена. Загрузите её заново.');
     if (file && !file.mime.startsWith('audio/')) failed(400, 'К сообщению можно прикрепить аудиозапись.');
     if (file && input.text) failed(400, 'Отправьте запись и текст отдельными сообщениями, чтобы сохранить точную расшифровку.');
-    c = save({ ...c, title: c.messages.length ? c.title : input.text ? input.text.slice(0, 65) + (input.text.length > 65 ? '…' : '') : `Разговор от ${new Intl.DateTimeFormat('ru-RU').format(new Date())}`, version: c.version + 1, status: file ? 'transcribing' : 'responding', error: null, errorOperation: null,
-      messages: [...c.messages, { id: input.id, role: 'user', text: input.text, createdAt: now(), file: file ? publicFile(file) : null, automatic: false, requestHash }] });
-    res.status(202).json(clean(c)); launch(c.id, signal => reply(c.id, account, signal));
+    // The person's words are saved first; a busy assistant only postpones the reply.
+    const postponed = busy();
+    const nextStatus = file ? 'transcribing' as const : 'responding' as const;
+    c = save({ ...c, title: c.messages.length ? c.title : input.text ? input.text.slice(0, 65) + (input.text.length > 65 ? '…' : '') : `Разговор от ${new Intl.DateTimeFormat('ru-RU').format(new Date())}`, version: c.version + 1,
+      ...(postponed ? { status: 'error' as const, error: 'Сообщение сохранено. Ассистент сейчас занят другими разговорами — запросите ответ через минуту.', errorOperation: nextStatus } : { status: nextStatus, error: null, errorOperation: null }),
+      messages: [...c.messages, { id: input.id, role: 'user', text: input.text, createdAt: now(), file: file ? clientFile(file) : null, automatic: false, requestHash }] });
+    res.status(202).json(clean(c)); if (!postponed) launch(c.id, signal => reply(c.id, account, signal));
   });
   app.patch('/api/conversations/:id/messages/:messageId', (req, res) => {
-    const c = access(String(req.params.id), user(res), true);
+    const account = user(res); const c = access(String(req.params.id), account, true);
     const input = versionSchema.extend({ text: z.string().trim().min(1).max(120000) }).parse(req.body);
     idleVersion(c, input.version);
     const index = lastUserIndex(c);
     if (index < 0 || c.messages[index].id !== req.params.messageId) failed(409, 'Можно исправить только последнее своё сообщение.');
     const messages = c.messages.slice(0, index + 1).map((m, i) => i === index ? { ...m, text: input.text, automatic: false, segments: [] } : m);
     if (conversationUserText(messages).length > 120000) failed(400, 'Разговор слишком длинный. Сократите текст или начните новый.');
-    res.json(clean(save({ ...c, messages, version: c.version + 1, status: 'idle', error: null, errorOperation: null })));
+    const previous = c.messages[index];
+    res.json(clean(store.transaction(() => {
+      // The earlier wording (and any automatic transcript) stays recoverable from history.
+      store.history('conversations', c.id, account.id, 'edit_message', { messageId: previous.id, text: previous.text, automatic: previous.automatic ?? false, segments: previous.segments ?? [] }, { messageId: previous.id, text: input.text });
+      return save({ ...c, messages, version: c.version + 1, status: 'idle', error: null, errorOperation: null });
+    })));
   });
   app.post('/api/conversations/:id/retry', (req, res) => {
     const account = user(res); let c = access(String(req.params.id), account, true);

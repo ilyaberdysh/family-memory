@@ -6,3 +6,9 @@ data
 !.env.example
 backups
 *.log
+exports
+*.sqlite
+*.sqlite-*
+.DS_Store
+.claude
+memory

@@ -2,10 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AssistantRuntimeProvider, ComposerPrimitive, MessagePrimitive, ThreadPrimitive, useExternalStoreRuntime, type AppendMessage, type ThreadMessageLike } from '@assistant-ui/react';
 import { Archive, ArrowDown, ArrowUp, Check, Download, FileAudio, FileText, Info, List, ListChecks, LoaderCircle, MessageSquare, Mic, Pencil, Plus, RotateCcw, Upload, X } from 'lucide-react';
 import type { AppState, Conversation, ConversationMessage, ConversationSummary, UploadedFile } from '../../shared/types';
-import { api, json, upload } from '../api';
-import { formatDate } from './ui';
+import { ApiError, api, json, upload } from '../api';
+import { DraftNote, formatDate } from './ui';
 import { MaterialDetail } from './Archive';
 import Recorder from './Recorder';
+import { PreviewNote, mediaSrc, originalHref, previewFailed, previewPending } from './media';
+import { clearDraft, draftKey, readDraft, useDraft, writeDraft } from '../drafts';
+import { forgetRecording, recordingIdOf } from '../recording-store';
 import './Assistant.css';
 
 interface AssistantProps {
@@ -21,6 +24,11 @@ const statusLabel = (status: Conversation['status']) => ({ idle: 'Сохране
 const route = (id: string) => `/api/conversations/${encodeURIComponent(id)}`;
 const asSummary = ({ messages, ...conversation }: Conversation): ConversationSummary => ({ ...conversation, messageCount: messages.length });
 const byUpdated = (a: ConversationSummary, b: ConversationSummary) => b.updatedAt.localeCompare(a.updatedAt);
+/** Server limits (after trimming): a new message and an edited message. */
+const MESSAGE_LIMIT = 20000;
+const EDIT_LIMIT = 120000;
+const count = (value: number) => new Intl.NumberFormat('ru').format(value);
+interface PendingMessage { id: string; text: string; fileId?: string; version: number }
 
 export default function Assistant({ state, onRefresh, onPersonOpen, onActivityChange }: AssistantProps) {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
@@ -80,7 +88,7 @@ export default function Assistant({ state, onRefresh, onPersonOpen, onActivityCh
   }, []);
 
   function canSwitch() {
-    return !blocked || window.confirm('Перейти к другому разговору? Неотправленный текст, запись или исправления будут потеряны.');
+    return !blocked || window.confirm('Перейти к другому разговору? Неотправленный текст останется черновиком в этом разговоре, а запись — на этом устройстве в списке несохранённых.');
   }
   async function open(id: string) {
     if (conversation?.id === id) { setListOpen(false); return; }
@@ -154,7 +162,15 @@ function ConversationView({ conversation, state, onChange, onRefresh, onActivity
   const editVersion = useRef(0);
   const voiceInput = useRef<HTMLInputElement | null>(null);
   const uploadedVoice = useRef<{ file: File; uploaded: UploadedFile } | null>(null);
-  const pendingMessage = useRef<{ id: string; text: string; fileId?: string; version: number } | null>(null);
+  const pendingMessage = useRef<PendingMessage | null>(null);
+  const uploadAbort = useRef<AbortController | null>(null);
+  const userId = state.user.id;
+  const composerKey = draftKey(userId, 'conversation', conversation.id);
+  const pendingKey = draftKey(userId, 'conversation-pending', conversation.id);
+  const messageKey = (messageId: string) => draftKey(userId, 'message', conversation.id, messageId);
+  const [composerRestored, setComposerRestored] = useState(false);
+  const [editRestored, setEditRestored] = useState(false);
+  const [storedEditId, setStoredEditId] = useState<string | null>(null);
   const mutationLock = useRef(false);
   const mutationEpoch = useRef(0);
   const mounted = useRef(true);
@@ -175,13 +191,19 @@ function ConversationView({ conversation, state, onChange, onRefresh, onActivity
   const errorHeading = failedAction === 'archive' ? 'Не удалось сохранить историю' : preparingFailure ? 'Не удалось подготовить сведения' : conversation.errorOperation === 'transcribing' ? 'Не удалось расшифровать запись' : error && !failedAction ? 'Не удалось выполнить действие' : 'Не удалось получить ответ';
   const canWrite = state.user.role !== 'viewer' && (state.user.role === 'admin' || conversation.createdBy === state.user.id);
   const lastUser = [...conversation.messages].reverse().find(item => item.role === 'user');
-  const editDirty = !!editing && editText !== conversation.messages.find(item => item.id === editing)?.text;
+  const editingOriginal = conversation.messages.find(item => item.id === editing)?.text ?? '';
+  const editDirty = !!editing && editText !== editingOriginal;
+  const draftLength = draft.trim().length;
+  const overLimit = draftLength > MESSAGE_LIMIT;
   const blocked = !!draft.trim() || !!voice || recording || editDirty || !!busy;
   const savedStatements = conversation.messages.some(item => item.role === 'user');
   const hasUnsent = !!draft.trim() || !!voice || recording;
   const voicePreview = useMemo(() => voice && !recorderOpen ? URL.createObjectURL(voice) : null, [voice, recorderOpen]);
   useEffect(() => () => { if (voicePreview) URL.revokeObjectURL(voicePreview); }, [voicePreview]);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  const composerDraft = useDraft(canWrite ? composerKey : null, draft, value => !value.trim());
+  const editDraft = useDraft(editing ? messageKey(editing) : null, editText, value => value === editingOriginal);
+  useEffect(() => { setStoredEditId(lastUser && readDraft<string>(messageKey(lastUser.id)) !== null ? lastUser.id : null); }, [lastUser?.id, editing]);
   useEffect(() => { onActivityChange(blocked); }, [blocked, onActivityChange]);
   useEffect(() => {
     if (!blocked) return;
@@ -214,18 +236,27 @@ function ConversationView({ conversation, state, onChange, onRefresh, onActivity
   async function append(message: AppendMessage) {
     const text = message.content.filter(part => part.type === 'text').map(part => part.text).join('\n').trim();
     if (mutationLock.current || !canWrite || working || recording || (!text && !voice)) return;
+    if (text.length > MESSAGE_LIMIT) { setError(`Сообщение длиннее ${count(MESSAGE_LIMIT)} символов. Сократите его или сохраните длинный рассказ через «Архив → История».`); return; }
     if (voice && text) { setError('Текст и голос отправляются отдельными сообщениями. Сначала отправьте запись, затем добавьте текст.'); return; }
     if (voice && voice.size > state.settings.maxUploadMb * 1024 * 1024) { setError(`Запись слишком большая. Максимум — ${state.settings.maxUploadMb} МБ.`); return; }
     mutationLock.current = true; mutationEpoch.current += 1; setBusy('send'); setError(''); setNotice(''); setFailedAction(null);
+    const sentVoice = voice;
+    const controller = new AbortController();
+    uploadAbort.current = controller;
+    let stage: 'upload' | 'send' = 'upload';
     try {
       let fileId: string | undefined;
-      if (voice) {
-        if (uploadedVoice.current?.file === voice) fileId = uploadedVoice.current.uploaded.id;
-        else { setProgress(0); const uploaded = await upload(voice, setProgress); uploadedVoice.current = { file: voice, uploaded }; fileId = uploaded.id; setProgress(null); }
+      if (sentVoice) {
+        if (uploadedVoice.current?.file === sentVoice) fileId = uploadedVoice.current.uploaded.id;
+        else { setProgress(0); const uploaded = await upload(sentVoice, { onProgress: setProgress, signal: controller.signal }); uploadedVoice.current = { file: sentVoice, uploaded }; fileId = uploaded.id; setProgress(null); }
       }
+      stage = 'send';
       const previous = pendingMessage.current;
-      const request = previous?.text === text && previous.fileId === fileId ? previous : { id: crypto.randomUUID(), text, fileId, version: current.current.version };
+      // The id makes retries idempotent; the version must be the current one for a message the server has not seen yet.
+      const request = previous?.text === text && previous.fileId === fileId ? { ...previous, version: current.current.version } : { id: crypto.randomUUID(), text, fileId, version: current.current.version };
       pendingMessage.current = request;
+      // Keep the id on the device too: resending after a reload then cannot create a duplicate.
+      if (!sentVoice) writeDraft(pendingKey, request);
       let next: Conversation;
       try { next = await api<Conversation>(`${route(conversation.id)}/messages`, json('POST', request)); }
       catch (cause) {
@@ -235,9 +266,16 @@ function ConversationView({ conversation, state, onChange, onRefresh, onActivity
         else { if (fresh) { onChange(fresh); request.version = fresh.version; } throw cause; }
       }
       onChange(next); pendingMessage.current = null; uploadedVoice.current = null;
-      if (mounted.current) { runtime.thread.composer.setText(''); setDraft(''); setVoice(null); setRecorderOpen(false); setNotice(''); }
-    } catch (cause) { if (mounted.current) setError(`Не удалось подтвердить сохранение сообщения. ${errorText(cause)} Текст и запись остались в форме; повторная отправка использует тот же номер сообщения.`); }
-    finally { mutationLock.current = false; if (mounted.current) { setBusy(''); setProgress(null); } }
+      // The server confirmed the message, so the device copies (draft text, message id, recording) can go.
+      composerDraft.clear(); clearDraft(composerKey); clearDraft(pendingKey); void forgetRecording(sentVoice);
+      if (mounted.current) { runtime.thread.composer.setText(''); setDraft(''); setVoice(null); setRecorderOpen(false); setNotice(''); setComposerRestored(false); }
+    } catch (cause) {
+      if (!mounted.current) return;
+      if (cause instanceof ApiError && cause.kind === 'cancelled') setError(cause.message);
+      else if (stage === 'upload') setError(`Не удалось загрузить запись. ${errorText(cause)}`);
+      else setError(`Не удалось подтвердить сохранение сообщения. ${errorText(cause)} Текст и запись остались в форме; повторная отправка использует тот же номер сообщения.`);
+    }
+    finally { uploadAbort.current = null; mutationLock.current = false; if (mounted.current) { setBusy(''); setProgress(null); } }
   }
 
   const convertMessage = useCallback((item: ConversationMessage): ThreadMessageLike => ({
@@ -248,16 +286,47 @@ function ConversationView({ conversation, state, onChange, onRefresh, onActivity
   const runtime = useExternalStoreRuntime<ConversationMessage>({
     messages: conversation.messages, convertMessage, isRunning: working,
     isDisabled: !canWrite || !!busy || !!editing,
-    isSendDisabled: working || recording || !!busy || !!editing,
+    isSendDisabled: working || recording || !!busy || !!editing || overLimit,
     onNew: append,
   });
   useEffect(() => {
     const sync = () => setDraft(runtime.thread.composer.getState().text);
     sync(); return runtime.thread.composer.subscribe(sync);
   }, [runtime]);
+  const restoredOnce = useRef(false);
+  useEffect(() => {
+    if (restoredOnce.current || !canWrite) return;
+    restoredOnce.current = true;
+    const pending = readDraft<PendingMessage>(pendingKey);
+    let text = readDraft<string>(composerKey);
+    if (pending && typeof pending.id === 'string') {
+      if (current.current.messages.some(item => item.id === pending.id)) {
+        // The last send reached the server before the page closed: do not offer the same text again.
+        clearDraft(pendingKey);
+        if (typeof text === 'string' && text.trim() === pending.text) { clearDraft(composerKey); text = null; }
+      } else pendingMessage.current = pending;
+    }
+    if (typeof text === 'string' && text.trim()) { runtime.thread.composer.setText(text); setComposerRestored(true); }
+  }, [runtime, canWrite, composerKey, pendingKey]);
+
+  function discardComposerDraft() {
+    if (!window.confirm('Удалить восстановленный текст? Вернуть его будет нельзя.')) return;
+    composerDraft.clear(); clearDraft(pendingKey); pendingMessage.current = null;
+    runtime.thread.composer.setText(''); setComposerRestored(false);
+  }
+  function startEdit(item: ConversationMessage) {
+    const stored = readDraft<string>(messageKey(item.id));
+    setEditing(item.id); setEditText(typeof stored === 'string' ? stored : item.text); setEditRestored(typeof stored === 'string' && stored !== item.text);
+    editVersion.current = conversation.version; setError(''); setFailedAction(null);
+  }
+  function cancelEdit() {
+    if (editDirty && !window.confirm('Отменить исправления сообщения? Черновик исправления будет удалён.')) return;
+    editDraft.clear(); if (editing) clearDraft(messageKey(editing));
+    setEditRestored(false); setEditing(null);
+  }
 
   function send() {
-    if (working || busy || recording || editing || (!draft.trim() && !voice)) return;
+    if (working || busy || recording || editing || overLimit || (!draft.trim() && !voice)) return;
     runtime.thread.append({ role: 'user', content: [{ type: 'text', text: runtime.thread.composer.getState().text }] });
   }
   function chooseVoice(file: File | null) {
@@ -265,7 +334,10 @@ function ConversationView({ conversation, state, onChange, onRefresh, onActivity
     if (file && file.size > state.settings.maxUploadMb * 1024 * 1024) setError(`Запись слишком большая. Максимум — ${state.settings.maxUploadMb} МБ.`);
   }
   function clearVoice() {
-    if ((voice || recording) && !window.confirm('Убрать неотправленную запись?')) return;
+    const recorded = !!recordingIdOf(voice);
+    const question = recording ? 'Остановить и убрать запись? Она останется на этом устройстве в списке несохранённых записей.' : voice ? recorded ? 'Удалить неотправленную запись? Она будет удалена и с этого устройства.' : 'Убрать выбранный аудиофайл из сообщения?' : '';
+    if (question && !window.confirm(question)) return;
+    if (!recording && recorded) void forgetRecording(voice);
     setRecorderOpen(false); setRecording(false); chooseVoice(null);
   }
   async function action(type: 'retry' | 'archive' | 'prepare') {
@@ -281,10 +353,13 @@ function ConversationView({ conversation, state, onChange, onRefresh, onActivity
   async function saveEdit() {
     if (!editing || mutationLock.current || working) return;
     if (!editText.trim()) { setError('Добавьте текст сообщения.'); return; }
+    if (editText.trim().length > EDIT_LIMIT) { setError(`Текст длиннее ${count(EDIT_LIMIT)} символов. Сократите его или сохраните длинный рассказ через «Архив → История».`); return; }
     mutationLock.current = true; mutationEpoch.current += 1; setBusy('edit'); setError(''); setFailedAction(null);
+    const editedId = editing;
     try {
       const next = await api<Conversation>(`${route(conversation.id)}/messages/${encodeURIComponent(editing)}`, json('PATCH', { text: editText, version: editVersion.current }));
-      onChange(next); setEditing(null); setNotice('Исправление сохранено. Можно запросить ответ заново.');
+      editDraft.clear(); clearDraft(messageKey(editedId));
+      onChange(next); setEditing(null); setEditRestored(false); setNotice('Исправление сохранено. Можно запросить ответ заново.');
     } catch (cause) { setError(errorText(cause)); }
     finally { mutationLock.current = false; setBusy(''); }
   }
@@ -304,14 +379,14 @@ function ConversationView({ conversation, state, onChange, onRefresh, onActivity
             <div className="assistant-message-author">{isUser ? state.users.find(user => user.id === conversation.createdBy)?.name || 'Участник' : 'Ассистент'}<time dateTime={original.createdAt}>{new Date(original.createdAt).toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit' })}</time></div>
             <div className="assistant-message-content">
               {original.file && <VoiceMessage file={original.file} />}
-              {editing === original.id ? <div className="assistant-message-editor"><label className="field">{original.file ? 'Текст записи' : 'Ваше сообщение'}<textarea autoFocus rows={5} maxLength={120000} value={editText} disabled={!!busy} onChange={event => setEditText(event.target.value)} /></label><p>Прежний ответ после этого сообщения будет сброшен. Оригинальная запись сохранится.</p><div><button className="button secondary" disabled={!!busy} onClick={() => { if (!editDirty || window.confirm('Отменить исправления сообщения?')) setEditing(null); }}>Отмена</button><button className="button primary" disabled={!!busy || !editText.trim()} onClick={() => void saveEdit()}>{busy === 'edit' ? 'Сохраняем…' : 'Сохранить исправление'}</button></div></div> : <>
+              {editing === original.id ? <div className="assistant-message-editor">{editRestored && <DraftNote onDiscard={() => { if (!window.confirm('Удалить несохранённое исправление?')) return; editDraft.clear(); clearDraft(messageKey(original.id)); setEditRestored(false); setEditText(original.text); }} onDismiss={() => setEditRestored(false)} />}<label className="field">{original.file ? 'Текст записи' : 'Ваше сообщение'}<textarea autoFocus rows={5} value={editText} disabled={!!busy} onChange={event => setEditText(event.target.value)} /></label>{editDraft.failed && <p className="draft-failed" role="status">Черновик не сохраняется на этом устройстве — сохраните исправление, прежде чем закрывать страницу.</p>}<p>Прежний ответ после этого сообщения будет сброшен. Оригинальная запись сохранится.</p><div><button className="button secondary" disabled={!!busy} onClick={cancelEdit}>Отмена</button><button className="button primary" disabled={!!busy || !editText.trim()} onClick={() => void saveEdit()}>{busy === 'edit' ? 'Сохраняем…' : 'Сохранить исправление'}</button></div></div> : <>
                 {original.automatic && original.text && <span className="assistant-transcript-label">Автоматическая расшифровка · проверьте имена и даты</span>}
                 {original.text ? <div className="assistant-message-text"><MessagePrimitive.Parts /></div> : original.file && !processing ? <p className="assistant-message-placeholder">Текст записи ещё не добавлен.</p> : null}
                 {original.interrupted && !preparingFailure && !processing && !displayedError && <p className="assistant-message-interrupted">Ответ не завершён.</p>}
               </>}
             </div>
             {canWrite && !processing && !busy && !editing && !hasUnsent && <div className="assistant-message-actions">
-              {lastUser?.id === original.id && <button className="assistant-text-button" onClick={() => { setEditing(original.id); setEditText(original.text); editVersion.current = conversation.version; setError(''); setFailedAction(null); }}><Pencil size={14} />{original.file ? original.text ? 'Исправить текст' : 'Добавить текст записи' : 'Исправить'}</button>}
+              {lastUser?.id === original.id && <button className="assistant-text-button" onClick={() => startEdit(original)}><Pencil size={14} />{storedEditId === original.id ? 'Продолжить исправление' : original.file ? original.text ? 'Исправить текст' : 'Добавить текст записи' : 'Исправить'}</button>}
               {lastAssistant && !displayedError && state.settings.aiAvailable && <button className="assistant-text-button" onClick={() => void action('retry')}><RotateCcw size={14} />Ответить заново</button>}
             </div>}
           </MessagePrimitive.Root>;
@@ -331,12 +406,16 @@ function ConversationView({ conversation, state, onChange, onRefresh, onActivity
       {canWrite && <div className="assistant-bottom">
         <ComposerPrimitive.Root className="assistant-composer" onSubmit={event => { event.preventDefault(); send(); }}>
           <div className="assistant-composer-content">
-            {recorderOpen && <div className="assistant-recorder-panel"><div className="assistant-attachment-heading"><strong>Голосовое сообщение</strong><button className="icon-button" type="button" disabled={!!busy} onClick={clearVoice} aria-label="Убрать запись"><X size={18} /></button></div><Recorder onRecorded={chooseVoice} onActiveChange={setRecording} disabled={!!busy || working} />{voice && <p className="assistant-voice-hint">Запись пока на этом устройстве. Нажмите «Отправить», чтобы сохранить её в разговоре.</p>}</div>}
+            {recorderOpen && <div className="assistant-recorder-panel"><div className="assistant-attachment-heading"><strong>Голосовое сообщение</strong><button className="icon-button" type="button" disabled={!!busy} onClick={clearVoice} aria-label="Убрать запись"><X size={18} /></button></div><Recorder onRecorded={chooseVoice} onActiveChange={setRecording} disabled={!!busy || working} userId={userId} context={`Ассистент · ${conversation.title || 'Новый разговор'}`} />{voice && <p className="assistant-voice-hint">Запись пока на этом устройстве. Нажмите «Отправить», чтобы сохранить её в разговоре.</p>}</div>}
             {voice && !recorderOpen && <div className="assistant-uploaded-voice"><span><FileAudio size={18} /><strong>{voice.name}</strong><button type="button" className="icon-button" onClick={clearVoice} disabled={!!busy} aria-label="Убрать аудиофайл"><X size={18} /></button></span>{voicePreview && <audio controls src={voicePreview} aria-label="Прослушать запись перед отправкой" />}</div>}
-            <ComposerPrimitive.Input placeholder={voice || recorderOpen ? 'Текст можно отправить отдельным сообщением.' : processing ? 'Можно набрать следующее сообщение…' : 'Напишите, что помните…'} aria-label="Сообщение ассистенту" minRows={empty ? 3 : 2} maxRows={8} submitMode="none" cancelOnEscape={false} addAttachmentOnPaste={false} disabled={!canWrite || !!busy || !!editing || recorderOpen || !!voice} maxLength={20000} onKeyDown={event => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); send(); } }} />
-            {progress !== null && <div className="assistant-upload-progress" role="status"><progress value={progress} max={100} /><span>{progress >= 100 ? 'Запись загружена. Подготавливаем воспроизведение…' : `Загружаем запись: ${Math.round(progress)}%`}</span></div>}
+            {composerRestored && !!draft.trim() && <DraftNote onDiscard={discardComposerDraft} onDismiss={() => setComposerRestored(false)} />}
+            <ComposerPrimitive.Input placeholder={voice || recorderOpen ? 'Текст можно отправить отдельным сообщением.' : processing ? 'Можно набрать следующее сообщение…' : 'Напишите, что помните…'} aria-label="Сообщение ассистенту" minRows={empty ? 3 : 2} maxRows={8} submitMode="none" cancelOnEscape={false} addAttachmentOnPaste={false} disabled={!canWrite || !!busy || !!editing || recorderOpen || !!voice} onKeyDown={event => { if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') { event.preventDefault(); send(); } }} />
+            {draft.length > MESSAGE_LIMIT * 0.9 && <p className={`assistant-length ${overLimit ? 'is-over' : ''}`}>{count(draftLength)} из {count(MESSAGE_LIMIT)} символов</p>}
+            {overLimit && <p className="assistant-length-error" role="alert">Сообщение слишком длинное и не будет отправлено. Сократите его или сохраните длинный рассказ через «Архив → История».</p>}
+            {composerDraft.failed && <p className="draft-failed" role="status">Черновик не сохраняется на этом устройстве — не закрывайте страницу, пока сообщение не отправлено.</p>}
+            {progress !== null && <div className="assistant-upload-progress" role="status"><progress value={progress} max={100} /><span>{progress >= 100 ? 'Файл передан, сервер проверяет его — не закрывайте страницу.' : `Загружаем запись: ${Math.round(progress)}%`}</span><button type="button" className="assistant-text-button" onClick={() => uploadAbort.current?.abort()}>Отменить загрузку</button></div>}
           </div>
-          <div className="assistant-composer-actions"><div>{processing ? <span className="assistant-draft-label">Черновик следующего сообщения</span> : <><button type="button" className="assistant-text-button assistant-record-button" aria-label={recorderOpen ? 'Скрыть диктофон' : 'Записать голосом'} disabled={!!busy || !!editing || recording || !!voice || !!draft.trim()} onClick={() => setRecorderOpen(value => !value)}><Mic size={18} /><span>{recorderOpen ? 'Скрыть диктофон' : 'Записать голосом'}</span></button><button type="button" className="icon-button" disabled={!!busy || !!editing || recording || !!voice || !!draft.trim()} onClick={() => voiceInput.current?.click()} aria-label="Загрузить аудиофайл"><Upload size={18} /></button></>}<input ref={voiceInput} hidden type="file" accept="audio/*,.m4a,.webm,.ogg" onChange={event => { setRecorderOpen(false); chooseVoice(event.target.files?.[0] || null); event.target.value = ''; }} /></div><button className="button primary assistant-send" type="submit" disabled={working || !!busy || recording || !!editing || (!draft.trim() && !voice)}><ArrowUp size={18} />{busy === 'send' ? 'Сохраняем…' : 'Отправить'}</button></div>
+          <div className="assistant-composer-actions"><div>{processing ? <span className="assistant-draft-label">Черновик следующего сообщения</span> : <><button type="button" className="assistant-text-button assistant-record-button" aria-label={recorderOpen ? 'Скрыть диктофон' : 'Записать голосом'} disabled={!!busy || !!editing || recording || !!voice || !!draft.trim()} onClick={() => setRecorderOpen(value => !value)}><Mic size={18} /><span>{recorderOpen ? 'Скрыть диктофон' : 'Записать голосом'}</span></button><button type="button" className="icon-button" disabled={!!busy || !!editing || recording || !!voice || !!draft.trim()} onClick={() => voiceInput.current?.click()} aria-label="Загрузить аудиофайл"><Upload size={18} /></button></>}<input ref={voiceInput} hidden type="file" accept="audio/*,.m4a,.webm,.ogg,.amr,.aiff,.aif,.wma" onChange={event => { setRecorderOpen(false); chooseVoice(event.target.files?.[0] || null); event.target.value = ''; }} /></div><button className="button primary assistant-send" type="submit" disabled={working || !!busy || recording || !!editing || overLimit || (!draft.trim() && !voice)}><ArrowUp size={18} />{busy === 'send' ? 'Сохраняем…' : 'Отправить'}</button></div>
         </ComposerPrimitive.Root>
         {empty && <ConversationPrivacy aiAvailable={state.settings.aiAvailable} />}
       </div>}
@@ -350,5 +429,9 @@ function ConversationPrivacy({ aiAvailable }: { aiAvailable: boolean }) {
 
 function VoiceMessage({ file }: { file: UploadedFile }) {
   const [error, setError] = useState(false);
-  return <div className="assistant-voice-message"><span><Mic size={16} />Голосовое сообщение</span><audio controls preload="metadata" src={file.url} onError={() => setError(true)} aria-label="Прослушать голосовое сообщение" />{error && <p role="alert">Браузер не смог воспроизвести запись. Скачайте оригинал и откройте его на устройстве.</p>}<a href={`${file.url}?original=1`} download={file.name}><Download size={14} />Скачать оригинал</a></div>;
+  const src = mediaSrc(file);
+  useEffect(() => setError(false), [src]);
+  // While the browser copy is prepared (or if that failed) the preview note explains instead of a generic error.
+  const explained = previewPending(file) || previewFailed(file);
+  return <div className="assistant-voice-message"><span><Mic size={16} />Голосовое сообщение</span><audio controls preload="metadata" src={src} onError={() => setError(true)} aria-label="Прослушать голосовое сообщение" /><PreviewNote file={file} link={false} />{error && !explained && <p role="alert">Браузер не смог воспроизвести запись. Скачайте оригинал и откройте его на устройстве.</p>}<a href={originalHref(file)} download={file.name}><Download size={14} />Скачать оригинал</a></div>;
 }
