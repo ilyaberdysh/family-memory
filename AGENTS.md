@@ -1,6 +1,7 @@
 # Family Memory
 
-This is a standalone application for one private family space per deployment.
+This is a multi-family service: one deployment hosts many private family spaces,
+isolated by `family_id` and PostgreSQL Row-Level Security (see CONTRACT.md).
 Read [README.md](README.md) for setup, [CONTRACT.md](CONTRACT.md) for architectural
 boundaries, and [DEPLOYMENT.md](DEPLOYMENT.md) for production operations.
 

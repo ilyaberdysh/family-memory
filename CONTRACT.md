@@ -1,14 +1,34 @@
 # Architecture and integration contract
 
-Family Memory is a standalone React + TypeScript application with Express,
-`node:sqlite` and local file storage. One deployment serves one private family
-space. It is not a shared multi-tenant service.
+Family Memory is a React + TypeScript service with Express, PostgreSQL and
+per-family file storage. One deployment serves many private family spaces.
+Accounts are global; each family has its own members, roles, tree, archive and
+conversations, and no family can read or change another family's data.
+
+## Families and isolation
+
+- Family-owned tables carry `family_id`. Every family statement goes through
+  `FamilyStore` (bound to one family), and PostgreSQL Row-Level Security refuses
+  rows of any other family even when application code forgets a filter.
+  Transactions run as the restricted role `family_app`; cross-family work
+  (workers, recovery, file lookup, scripts) must use `db.system()` explicitly.
+- `families`, `users`, `memberships`, `sessions`, `invitation_links` are global
+  tables without RLS and must always be filtered in code.
+- Family requests send `X-Family-Id`; membership (role, status, personId) is
+  checked on every request. `GET /api/files/:id` resolves the family from the file.
+- Any signed-in person can create a family (`POST /api/families`) and becomes its
+  administrator. People join only through that family's invitation links.
+- Files live in `files/<familyId>/` behind the `BlobStore` interface.
+  `FAMILY_STORAGE_LIMIT_MB` optionally limits each family's storage.
+- Without `DATABASE_URL`, local preview and tests use embedded PGlite in
+  `DATA_DIR/pglite`; `scripts/import-sqlite.mts` moves a legacy single-family
+  SQLite install into one family.
 
 ## Runtime and persistence
 
 - Development uses Vite middleware on the Express server; production serves `dist` from the same process. The default port is `4317`.
-- `DATA_DIR` contains `family.sqlite` and `files/`. Container deployments mount the parent at `/var/lib/family-space` and use `/var/lib/family-space/data`.
-- Run one application process per database, including during deployment replacement. Background jobs are not coordinated across replicas.
+- `DATABASE_URL` selects PostgreSQL; `DATA_DIR` contains `files/` (and `pglite/` without `DATABASE_URL`). Container deployments mount the parent at `/var/lib/family-space` and use `/var/lib/family-space/data`.
+- Run one application process per database during deployment replacement: startup recovery marks in-flight work of a still-running old process as interrupted. Queue claims use row locks (`FOR UPDATE SKIP LOCKED`).
 - In production inside a container the server refuses to start when `DATA_DIR` lies on the container's writable layer (same device as `/`): a forgotten volume must fail loudly, not lose data at the next redeploy. `ALLOW_EPHEMERAL_DATA=1` exists only for throwaway checks. Every start logs the data location and record counts.
 - Nothing family-provided is hard-deleted by the application. People, facts, relations, materials, files and conversations have no delete endpoints; corrections create new versions and history keeps the previous ones.
 - Shutdown stops accepting connections, waits up to `SHUTDOWN_TIMEOUT_MS` for requests in flight (uploads included), then interrupts background work explicitly before closing the database.
