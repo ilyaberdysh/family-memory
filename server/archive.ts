@@ -363,8 +363,10 @@ export function createWorkers({ db, blobs }: ArchiveContext) {
   }
   let kicking: Promise<void> | null = null;
   function kick() {
-    if (kicking || stopped) return;
-    kicking = (async () => {
+    if (kicking || stopped || running.size >= concurrency) return;
+    let current: Promise<void> | undefined;
+    current = (async () => {
+      await null; // let `kicking` be assigned before the body can finish
       try {
         while (!stopped && running.size < concurrency) {
           const next = await claimPreview(); if (!next) break;
@@ -372,8 +374,9 @@ export function createWorkers({ db, blobs }: ArchiveContext) {
           running.add(task);
         }
       } catch (error) { if (!stopped) console.error('Preview queue failed:', error instanceof Error ? error.message : 'Unknown error'); }
-      finally { kicking = null; }
+      finally { if (kicking === current) kicking = null; }
     })();
+    kicking = current;
   }
   async function runJob(familyId: string, job: Job) {
     const field = job.type === 'transcribe' ? 'transcriptionStatus' : 'extractionStatus';

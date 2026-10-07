@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -193,7 +193,7 @@ test('browser previews normalize recordings and video while authenticated origin
       assert.equal(status, 201, file.error ?? 'The original should be accepted'); assert.equal(file.mime, sample.inputMime); assert.equal(file.previewStatus, 'pending');
       await f.processMedia();
       const record = (await f.get<{ mime: string; path: string; previewPath: string; previewStatus: string; sha256: string }>('files', file.id))!;
-      assert.equal(record.mime, sample.inputMime); assert.ok(record.previewPath); assert.equal(record.previewStatus, 'ready');
+      assert.equal(record.previewStatus, "ready", JSON.stringify(record)); assert.equal(record.mime, sample.inputMime); assert.ok(record.previewPath); assert.equal(record.previewStatus, 'ready');
       assert.equal(record.sha256, createHash('sha256').update(bytes).digest('hex'));
       const original = await fetch(f.base + file.url + '?original=1', { headers: { Cookie: f.admin.cookie } });
       assert.equal(original.headers.get('content-type'), sample.inputMime);
@@ -257,4 +257,127 @@ test('an original survives a failed browser copy and digitised archive formats a
     assert.deepEqual((await readdir(f.familyDir)).filter(name => !name.startsWith('.') && !stored.has(name)), []);
     assert.deepEqual(await readdir(join(f.filesRoot, '.incoming')), []);
   } finally { await f.cleanup(); await rm(generated, { recursive: true, force: true }); }
+});
+
+test('explicit name parts stay synchronized with reviewed facts without parsing legacy names', async () => {
+  const f = await fixture();
+  try {
+    await f.request('/api/invitations', f.admin, { email: 'reviewer@example.test', role: 'member' });
+    const reviewer = await f.login('reviewer@example.test');
+    const parts = { lastName: ' Тестовая ', firstName: 'Мария', patronymic: 'Ивановна' };
+    const created = await f.request('/api/people', f.admin, { nameParts: parts });
+    assert.equal(created.status, 201); assert.equal(created.body.name, 'Тестовая Мария Ивановна');
+    const fact = (await f.all<Fact>('facts')).find(item => item.personId === created.body.id && item.key === 'name')!;
+    assert.deepEqual(fact.nameParts, { ...parts, lastName: 'Тестовая' });
+    await f.request(`/api/review/facts/${fact.id}`, reviewer, { action: 'confirm', version: fact.version });
+    const changedParts = { ...fact.nameParts!, lastName: 'Уточнённая' };
+    const changed = await f.request(`/api/facts/${fact.id}`, f.admin, { nameParts: changedParts, source: '', version: 1 }, 'PATCH');
+    assert.equal(changed.body.status, 'unconfirmed'); assert.equal(changed.body.confirmedBy, null); assert.equal(changed.body.version, 2);
+    assert.equal((await f.get<Person>('people', created.body.id))?.name, changed.body.value);
+    assert.deepEqual((await f.get<Person>('people', created.body.id))?.nameParts, changedParts);
+    const legacy = await f.request('/api/people', f.admin, { name: 'Старая запись без разбора' });
+    assert.equal(legacy.body.name, 'Старая запись без разбора'); assert.equal(legacy.body.nameParts, undefined);
+    const raw = await f.request(`/api/facts/${fact.id}`, f.admin, { value: 'Исправление старым клиентом', source: '', version: 2 }, 'PATCH');
+    assert.equal(raw.body.nameParts, undefined); assert.equal((await f.get<Person>('people', created.body.id))?.nameParts, undefined);
+    const material = (await f.request('/api/materials', f.admin, { title: 'Источник имени', kind: 'story', body: 'Исходный рассказ' })).body as Material;
+    const proposed = proposal('structured-name', 'set_fact', { personId: created.body.id, key: 'name', value: 'Это значение будет собрано из частей', baseVersion: 3, nameParts: changedParts });
+    const proposedPerson = proposal('structured-person', 'create_person', { personName: 'Имя из предложения', nameParts: { firstName: 'Пётр', lastName: '', patronymic: '' } });
+    await f.put('materials', { ...material, proposals: [proposed, proposedPerson] });
+    const accepted = await f.request(`/api/materials/${material.id}/proposals`, f.admin, { accept: [proposed, proposedPerson], reject: [], transcriptVersion: null });
+    assert.equal(accepted.status, 200, JSON.stringify(accepted.body));
+    assert.deepEqual((await f.get<Person>('people', created.body.id))?.nameParts, changedParts);
+    assert.equal((await f.get<Fact>('facts', fact.id))?.status, 'unconfirmed'); assert.equal((await f.get<Fact>('facts', fact.id))?.version, 4);
+    assert.ok((await f.all<Person>('people')).some(item => item.name === 'Пётр' && item.nameParts?.firstName === 'Пётр'));
+  } finally { await f.cleanup(); }
+});
+
+test('real full dates reject impossible days while optional and approximate dates stay compatible', async () => {
+  const f = await fixture();
+  try {
+    const invalid = await f.request('/api/people', f.admin, { name: 'Invalid date', facts: { birthDate: '29.02.1900' } });
+    assert.equal(invalid.status, 400); assert.match(invalid.body.error, /календаре/); assert.equal((await f.all('people')).length, 0);
+    const person = (await f.request('/api/people', f.admin, { name: 'Dates', facts: { birthDate: '2000-02-29', deathDate: '' } })).body as Person;
+    const birth = (await f.all<Fact>('facts')).find(item => item.personId === person.id && item.key === 'birthDate')!;
+    assert.equal(birth.value, '29.02.2000'); assert.ok(!(await f.all<Fact>('facts')).some(item => item.key === 'deathDate'));
+    assert.equal((await f.request(`/api/facts/${birth.id}`, f.admin, { value: '31.04.2000', source: '', version: 1 }, 'PATCH')).status, 400);
+    const approximate = await f.request(`/api/facts/${birth.id}`, f.admin, { value: 'около 1950', source: '', version: 1 }, 'PATCH');
+    assert.equal(approximate.body.value, 'около 1950');
+    const material = (await f.request('/api/materials', f.admin, { title: 'Дата воспоминания', kind: 'story', body: 'Сохранённый рассказ', personIds: [person.id], occurredAt: '1987' })).body as Material;
+    assert.equal(material.occurredAt, '1987');
+    const dateOnly = await f.request(`/api/materials/${material.id}`, f.admin, { occurredAt: 'лето 1987 года', version: 1 }, 'PATCH');
+    assert.equal(dateOnly.body.occurredAt, 'лето 1987 года'); assert.equal(dateOnly.body.body, material.body); assert.deepEqual(dateOnly.body.personIds, [person.id]);
+    const badProposal = proposal('bad-date', 'set_fact', { personId: person.id, key: 'deathDate', value: '2023-02-29' });
+    await f.put('materials', { ...dateOnly.body, proposals: [badProposal] });
+    assert.equal((await f.request(`/api/materials/${material.id}/proposals`, f.admin, { accept: [badProposal], reject: [], transcriptVersion: null })).status, 400);
+    assert.ok(!(await f.all<Fact>('facts')).some(item => item.key === 'deathDate'));
+  } finally { await f.cleanup(); }
+});
+
+test('proposal review reuses an already mapped person and refuses two values for one fact', async () => {
+  const f = await fixture();
+  try {
+    const material = (await f.request('/api/materials', f.admin, { title: 'Repeated source', kind: 'story', body: 'Мария родилась в Туле. Мария жила в Туле.' })).body as Material;
+    const first = proposal('first', 'create_person', { personName: 'Мария', sourceQuote: 'Мария родилась в Туле.' });
+    await f.put('materials', { ...material, proposals: [first] });
+    const created = await f.request(`/api/materials/${material.id}/proposals`, f.admin, { accept: [first], reject: [], transcriptVersion: null });
+    assert.equal(created.status, 200, JSON.stringify(created.body));
+    const maria = (await f.all<Person>('people'))[0];
+    // Re-extraction mentions the same relative again; mapping it to the existing card is not a duplicate.
+    const again = proposal('again', 'create_person', { personName: 'Мария', sourceQuote: 'Мария жила в Туле.' });
+    const current = (await f.get<Material>('materials', material.id))!;
+    await f.put('materials', { ...current, proposals: [...current.proposals!, again] });
+    const mapped = await f.request(`/api/materials/${material.id}/proposals`, f.admin, { accept: [{ ...again, personId: maria.id }], reject: [], transcriptVersion: null });
+    assert.equal(mapped.status, 200, JSON.stringify(mapped.body));
+    assert.equal((await f.all('people')).length, 1);
+    // Two accepted values for the same field must not silently overwrite each other.
+    const birth1920 = proposal('b1920', 'set_fact', { personId: maria.id, key: 'birthDate', value: '1920', sourceQuote: 'Мария родилась в Туле.' });
+    const birth1925 = proposal('b1925', 'set_fact', { personId: maria.id, key: 'birthDate', value: '1925', sourceQuote: 'Мария жила в Туле.' });
+    const latest = (await f.get<Material>('materials', material.id))!;
+    await f.put('materials', { ...latest, proposals: [...latest.proposals!, birth1920, birth1925] });
+    assert.equal((await f.request(`/api/materials/${material.id}/proposals`, f.admin, { accept: [birth1920, birth1925], reject: [], transcriptVersion: null })).status, 409);
+    assert.equal((await f.all<Fact>('facts')).filter(fact => fact.key === 'birthDate').length, 0);
+    // A reviewer's correction is accepted but marked: the quote no longer proves the value verbatim.
+    const corrected = await f.request(`/api/materials/${material.id}/proposals`, f.admin, { accept: [{ ...birth1920, value: '1921' }], reject: [birth1925.id], transcriptVersion: null });
+    assert.equal(corrected.status, 200, JSON.stringify(corrected.body));
+    const fact = (await f.all<Fact>('facts')).find(item => item.key === 'birthDate')!;
+    assert.equal(fact.value, '1921'); assert.equal(fact.sourceEdited, true); assert.equal(fact.sourceQuote, 'Мария родилась в Туле.');
+  } finally { await f.cleanup(); }
+});
+
+test('interrupted paid processing becomes an explicit error after restart instead of running again', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'family-space-restart-'));
+  const options = { memoryDatabase: false, databaseUrl: '', dataDir, devAuth: true, production: false, bindHost: '127.0.0.1', adminEmail: '', startWorker: false };
+  const familyId = randomUUID();
+  try {
+    const first = await createApp(options);
+    await first.db.global(g => g.put('families', { id: familyId, name: 'Synthetic', surnames: [], createdBy: 'admin', createdAt: '' }));
+    await first.db.family(familyId, async s => {
+      await s.put('materials', { id: 'material', title: 'Synthetic', kind: 'audio', body: '', narrator: '', occurredAt: '', personIds: [], file: null, createdBy: 'admin', createdAt: '', updatedAt: '', version: 1, transcriptionStatus: 'processing', extractionStatus: 'idle', processingError: null });
+      await s.put('jobs', { id: 'job', materialId: 'material', actorId: 'admin', type: 'transcribe', status: 'processing', sourceVersion: null, sourceHash: '', createdAt: '' });
+      await s.put('files', { id: 'file', name: 'x', mime: 'video/x-msvideo', size: 1, url: '/api/files/file', createdBy: 'admin', path: 'missing', previewStatus: 'processing', previewAttempts: 3 });
+    });
+    await first.close();
+    const second = await createApp(options);
+    try {
+      await second.db.family(familyId, async s => {
+        assert.equal((await s.get<{ status: string }>('jobs', 'job'))!.status, 'error');
+        const material = (await s.get<Material>('materials', 'material'))!;
+        assert.equal(material.transcriptionStatus, 'error'); assert.match(material.processingError!, /вручную/);
+        // A conversion that kept crashing the process is given up after a bounded number of attempts.
+        assert.equal((await s.get<{ previewStatus: string }>('files', 'file'))!.previewStatus, 'failed');
+      });
+    } finally { await second.close(); }
+  } finally { await rm(dataDir, { recursive: true, force: true }); }
+});
+
+test('an oversized upload is refused clearly and leaves no partial bytes behind', async () => {
+  const previous = process.env.MAX_UPLOAD_MB; process.env.MAX_UPLOAD_MB = '1';
+  const f = await fixture();
+  try {
+    const response = await f.upload(f.admin, Buffer.alloc(3 * 1024 * 1024, 7), 'big.bin');
+    assert.equal(response.status, 400); assert.match(response.body.error ?? '', /1 МБ/);
+    assert.deepEqual(await readdir(f.familyDir).catch(() => []), []);
+    assert.deepEqual((await readdir(f.filesRoot).catch(() => [] as string[])).filter(name => name !== '.incoming' && name !== f.familyId), []);
+    assert.deepEqual(await readdir(join(f.filesRoot, '.incoming')).catch(() => []), []);
+  } finally { await f.cleanup(); if (previous === undefined) delete process.env.MAX_UPLOAD_MB; else process.env.MAX_UPLOAD_MB = previous; }
 });

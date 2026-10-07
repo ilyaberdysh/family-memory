@@ -1,33 +1,28 @@
 import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
-import { createHash } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { lstat, mkdir, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { Store } from '../server/store.js';
 import { SNAPSHOT_NAME, startBackupScheduler, type BackupSchedulerOptions } from '../server/backups.js';
-import { createBackup } from '../scripts/backup.mjs';
+import { createBackup } from '../scripts/backup.mts';
+import { FAMILY_A, addFile, openDb, seedFamily, workspace } from './backup-fixtures.ts';
 
 // Synthetic archive only.
 const photo = { path: 'a1b2c3d4e5f60718293a4b5c6d7e8f90', bytes: Buffer.alloc(6000, 'synthetic scheduler photo ') };
 
 async function archive(t: TestContext) {
-  const root = await mkdtemp(join(tmpdir(), 'family-backup-scheduler-test-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await workspace(t, 'backup-scheduler');
   const data = join(root, 'data');
-  const store = new Store(data);
-  try {
-    await writeFile(join(data, 'files', photo.path), photo.bytes);
-    store.put('files', { id: 'photo', name: 'Синтетический снимок', mime: 'image/jpeg', size: photo.bytes.length, url: '/api/files/photo', createdBy: 'admin', path: photo.path, sha256: createHash('sha256').update(photo.bytes).digest('hex') });
-  } finally { store.close(); }
+  const { db } = await openDb(t);
+  await seedFamily(db, FAMILY_A, 'Синтетическая семья', { id: 'admin', name: 'Администратор' });
+  await addFile(db, data, FAMILY_A, 'photo', photo, { extra: { name: 'Синтетический снимок', mime: 'image/jpeg' } });
   const logs: string[] = [];
   const start = (options: Partial<BackupSchedulerOptions> = {}) => {
-    const scheduler = startBackupScheduler({ dataDir: data, backupDir: join(root, 'backups'), firstDelayMs: 3_600_000, log: line => logs.push(line), ...options });
+    const scheduler = startBackupScheduler({ db, dataDir: data, backupDir: join(root, 'backups'), firstDelayMs: 3_600_000, log: line => logs.push(line), ...options });
     t.after(() => scheduler.close());
     return scheduler;
   };
-  return { root, data, backups: join(root, 'backups'), logs, start };
+  return { root, data, db, backups: join(root, 'backups'), logs, start };
 }
 
 const snapshots = async (directory: string) => (await readdir(directory).catch(() => [] as string[])).filter(name => SNAPSHOT_NAME.test(name)).sort();
@@ -49,7 +44,7 @@ test('runNow never overlaps, links unchanged files to the previous snapshot and 
   await scheduler.runNow();
   const kept = await snapshots(f.backups);
   assert.equal(kept.length, 2);
-  assert.equal((await stat(join(f.backups, kept[0], 'files', photo.path))).ino, (await stat(join(f.backups, kept[1], 'files', photo.path))).ino);
+  assert.equal((await stat(join(f.backups, kept[0], 'files', FAMILY_A, photo.path))).ino, (await stat(join(f.backups, kept[1], 'files', FAMILY_A, photo.path))).ino);
   const status = scheduler.status();
   assert.equal(status.lastResult, 'ok');
   assert.equal(status.stale, false);
@@ -95,7 +90,7 @@ test('close() aborts a running backup and leaves no partial snapshot', async t =
 
 test('the first automatic run happens only when the last success is older than the interval', async t => {
   const f = await archive(t);
-  await createBackup(f.data, join(f.root, 'manual'));
+  await createBackup({ db: f.db, dataDir: f.data, destination: join(f.root, 'manual') });
   const recent = f.start({ firstDelayMs: 0 });
   await delay(300);
   assert.deepEqual(await snapshots(f.backups), [], 'a recent manual backup counts');
@@ -114,8 +109,8 @@ test('without BACKUP_DIR the scheduler is manual-only but still reports CLI back
   const scheduler = f.start({ backupDir: undefined, firstDelayMs: 0 });
   assert.deepEqual(scheduler.status(), { automatic: false, intervalHours: null, running: false, lastAttemptAt: null, lastSuccessAt: null, lastResult: null, lastError: null, problemFiles: 0, stale: true });
   await assert.rejects(() => scheduler.runNow(), /BACKUP_DIR/);
-  await rm(join(f.data, 'files', photo.path));
-  await createBackup(f.data, join(f.root, 'manual'));
+  await rm(join(f.data, 'files', FAMILY_A, photo.path));
+  await createBackup({ db: f.db, dataDir: f.data, destination: join(f.root, 'manual') });
   const status = scheduler.status();
   assert.equal(status.lastResult, 'degraded');
   assert.equal(status.problemFiles, 1);

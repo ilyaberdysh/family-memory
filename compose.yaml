@@ -1,15 +1,42 @@
 services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: family
+      POSTGRES_USER: family
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - family_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U family -d family"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # Not published: only the app reaches the database over the Compose network.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   app:
     build: .
     init: true
     restart: unless-stopped
     env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
       NODE_ENV: production
       DEV_AUTH: "0"
       HOST: 0.0.0.0
       PORT: "4317"
       DATA_DIR: ${DATA_DIR:-/var/lib/family-space/data}
+      DATABASE_URL: postgres://family:${POSTGRES_PASSWORD}@db:5432/family
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
+      FAMILY_STORAGE_LIMIT_MB: ${FAMILY_STORAGE_LIMIT_MB:-0}
       PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Set the HTTPS application origin in .env}
       ADMIN_TELEGRAM_ID: ${ADMIN_TELEGRAM_ID:-}
       TELEGRAM_CLIENT_ID: ${TELEGRAM_CLIENT_ID:-}
@@ -33,3 +60,4 @@ services:
 
 volumes:
   family_data:
+  family_db:
