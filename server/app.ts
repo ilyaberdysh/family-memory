@@ -168,7 +168,8 @@ export async function createApp(options: AppOptions = {}) {
         let account = matches[0];
         if (account && ((account.telegramId && account.telegramId !== identity.telegramId) || (account.telegramSubject && account.telegramSubject !== identity.subject))) fail(409, 'Conflicting identity');
         // A migrated single-family install has one local administrator; its designated owner binds to it once.
-        if (!account && adminTelegramId && identity.telegramId === adminTelegramId) {
+        // Only for a single migrated install: in a multi-family service the local admin may belong to someone else's family.
+        if (!account && adminTelegramId && identity.telegramId === adminTelegramId && Number((await g.raw('SELECT count(*) AS n FROM families'))[0].n) <= 1) {
           const legacy = (await g.where<User>('users', "coalesce(data->>'telegramId', '') = '' AND coalesce(data->>'telegramSubject', '') = '' AND (data->>'email' = 'admin@local.invalid' OR ($1 <> '' AND data->>'email' = $1))", adminEmail));
           if (legacy.length === 1) account = legacy[0];
         }
@@ -190,6 +191,8 @@ export async function createApp(options: AppOptions = {}) {
     const current = await sessionUser(req);
     const result = await db.global(async g => {
       const link = await invitationFromToken(g, req.body?.token);
+      // Claim the single-use link first under a row lock, so two simultaneous redemptions cannot both succeed.
+      if (!(await g.raw("UPDATE invitation_links SET data = data || '{\"uses\":1}'::jsonb WHERE id = $1 AND coalesce((data->>'uses')::int, 0) = 0 AND data->>'usedAt' IS NULL RETURNING id", [link.id])).length) fail(410, 'Ссылка больше не действует. Попросите администратора прислать новую.');
       let account: User;
       if (link.userId) {
         account = (await g.get<User>('users', link.userId)) ?? fail(410, 'Ссылка больше не действует. Попросите администратора прислать новую.');

@@ -150,7 +150,8 @@ export async function importSqlite(options: ImportOptions): Promise<ImportResult
       await writer.flush();
       const created = writer.inserted.users ?? 0;
       for (const user of users) {
-        const membership = { id: randomUUID(), familyId, userId: String(user.id), role: user.role ?? 'member', status: user.status ?? 'active', personId: user.personId ?? null, createdAt: typeof user.createdAt === 'string' ? user.createdAt : now };
+        const membership = { id: randomUUID(), familyId, userId: String(user.id), role: user.role ?? 'member', // Legacy 'profile' meant "signed in, profile unfinished": guests were preapproved, others still awaited approval.
+          status: user.status === 'profile' ? (user.authProvider === 'guest' ? 'active' : 'pending') : user.status ?? 'active', personId: user.personId ?? null, createdAt: typeof user.createdAt === 'string' ? user.createdAt : now };
         await writer.add('memberships', { id: membership.id, familyId, userId: membership.userId, data: membership });
       }
       // Login codes and unfinished Telegram handshakes are short-lived and dropped; sessions and guest links keep working.

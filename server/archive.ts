@@ -380,12 +380,15 @@ export function createWorkers({ db, blobs }: ArchiveContext) {
   }
   async function runJob(familyId: string, job: Job) {
     const field = job.type === 'transcribe' ? 'transcriptionStatus' : 'extractionStatus';
-    const { before, people, facts, file } = await db.family(familyId, async s => {
-      const before = await found(s.get<Material>('materials', job.materialId));
+    const loaded = await db.family(familyId, async s => {
+      const before = await s.get<Material>('materials', job.materialId);
+      if (!before) { await s.put('jobs', { ...job, status: 'error', error: 'Материал не найден.' }); return undefined; }
       const file = job.type === 'transcribe' && before.file ? await s.get<FileRecord>('files', before.file.id) : undefined;
       await s.put('materials', { ...before, [field]: 'processing', processingError: null });
       return { before, file, people: await s.all<Person>('people'), facts: await s.all<Fact>('facts') };
     });
+    if (!loaded) return;
+    const { before, people, facts, file } = loaded;
     try {
       if ((before.transcript?.version ?? null) !== job.sourceVersion || hash(sourceText(before)) !== job.sourceHash) fail(409, 'Текст изменился до начала обработки. Запустите её заново.');
       let transcript: Transcript | null = null; let proposals: Proposal[] | null = null; let extractionRejectedCount = 0;

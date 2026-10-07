@@ -62,7 +62,7 @@ test('a legacy DATA_DIR becomes one new family; accounts, sessions and guest lin
   assert.equal((rows.users[0] as { telegramSubject: string }).telegramSubject, 'sub-1');
   assert.equal((rows.users[0] as { role?: string }).role, undefined, 'roles live in memberships');
   assert.deepEqual((rows.memberships as { userId: string; role: string; status: string; personId: string | null; familyId: string }[]).map(m => [m.userId, m.role, m.status, m.personId, m.familyId]),
-    [['legacy-admin', 'admin', 'active', 'person-1', result.familyId], ['legacy-member', 'member', 'active', null, result.familyId], ['legacy-new', 'viewer', 'profile', null, result.familyId]]);
+    [['legacy-admin', 'admin', 'active', 'person-1', result.familyId], ['legacy-member', 'member', 'active', null, result.familyId], ['legacy-new', 'viewer', 'pending', null, result.familyId]]);
   assert.deepEqual((rows.sessions as { id: string }[]).map(session => session.id), ['session-live']);
   assert.deepEqual([rows.codes, rows.auth_flows], [[], []]);
   assert.deepEqual(rows.invitation_links, [{ id: 'link-1', tokenHash: sha('synthetic link token'), role: 'member', revokedAt: null, uses: 0, familyId: result.familyId }]);

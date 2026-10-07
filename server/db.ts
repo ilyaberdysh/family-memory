@@ -29,7 +29,7 @@ interface Driver { connect<T>(fn: (connection: Connection) => Promise<T>): Promi
 const MIGRATIONS: string[] = [
   // 1: multi-family schema
   `
-  DO $$ BEGIN CREATE ROLE family_app NOLOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+  DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'family_app') THEN CREATE ROLE family_app NOLOGIN; END IF; END $$;
   CREATE TABLE families (id uuid PRIMARY KEY, data jsonb NOT NULL, seq bigserial);
   CREATE TABLE users (id text PRIMARY KEY, data jsonb NOT NULL, seq bigserial);
   CREATE UNIQUE INDEX users_telegram_id ON users ((data->>'telegramId')) WHERE coalesce(data->>'telegramId', '') <> '';
@@ -63,11 +63,16 @@ const MIGRATIONS: string[] = [
   ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO family_app;
   ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO family_app;
   `,
+  // 2: a non-superuser application user (managed PostgreSQL, PG16+) needs explicit membership to SET ROLE family_app
+  `GRANT family_app TO CURRENT_USER;`,
 ];
 
 function pgDriver(url: string): Driver {
   let pool: import('pg').Pool | undefined;
-  const ready = import('pg').then(({ default: pg }) => { pool = new pg.Pool({ connectionString: url, max: Number(process.env.DATABASE_POOL_SIZE) || 10 }); return pool; });
+  const ready = import('pg').then(({ default: pg }) => { pool = new pg.Pool({ connectionString: url, max: Number(process.env.DATABASE_POOL_SIZE) || 10 });
+    // A dropped idle connection (database restart, network blip) must not crash the process; the pool reconnects.
+    pool.on('error', error => console.error('PostgreSQL idle connection error:', error.message));
+    return pool; });
   return {
     async connect(fn) { const client = await (await ready).connect(); try { return await fn(client); } finally { client.release(); } },
     async close() { await (await ready).end(); void pool; },
