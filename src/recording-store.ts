@@ -16,6 +16,8 @@ export interface RecordingSession {
   size: number;
   chunkCount: number;
   userId?: string;
+  /** Family the recording was made for; recordings made before families existed have none and show everywhere. */
+  familyId?: string;
   /** Human label of where it was recorded, e.g. "Архив · новый материал". */
   context: string;
   /** false while recording, or when the page died before the recorder stopped. */
@@ -137,12 +139,12 @@ export interface RecordingBackup {
 }
 
 /** Starts a device copy for a new recording and holds it for this tab until releaseRecording(id). */
-export function startRecordingBackup(meta: { mimeType: string; userId?: string; context: string }, onUnavailable: () => void): RecordingBackup {
+export function startRecordingBackup(meta: { mimeType: string; userId?: string; familyId?: string; context: string }, onUnavailable: () => void): RecordingBackup {
   requestPersistentStorage();
   const id = newId();
   held.add(id);
   const startedAt = new Date().toISOString();
-  const session: RecordingSession = { id, mimeType: meta.mimeType, startedAt, updatedAt: startedAt, durationSeconds: 0, size: 0, chunkCount: 0, userId: meta.userId, context: meta.context, finished: false };
+  const session: RecordingSession = { id, mimeType: meta.mimeType, startedAt, updatedAt: startedAt, durationSeconds: 0, size: 0, chunkCount: 0, userId: meta.userId, familyId: meta.familyId, context: meta.context, finished: false };
   let failed = false; let seq = 0;
   let queue: Promise<void> = transaction([SESSIONS], 'readwrite', tx => { tx.objectStore(SESSIONS).put({ ...session }); return () => undefined; });
   const fail = () => {
@@ -193,7 +195,7 @@ export function isRecordingElsewhere(session: RecordingSession) {
 }
 
 /** Recordings on this device that never reached the server, newest first. Rejects if IndexedDB is unavailable. */
-export async function listRecordings(userId?: string): Promise<RecordingSession[]> {
+export async function listRecordings(userId?: string, familyId?: string): Promise<RecordingSession[]> {
   const all = await transaction([SESSIONS], 'readonly', tx => { const request = tx.objectStore(SESSIONS).getAll(); return () => request.result as RecordingSession[]; });
   const visible: RecordingSession[] = [];
   for (const session of all) {
@@ -204,6 +206,7 @@ export async function listRecordings(userId?: string): Promise<RecordingSession[
       continue;
     }
     if (userId && session.userId && session.userId !== userId) continue;
+    if (familyId && session.familyId && session.familyId !== familyId) continue;
     visible.push(session);
   }
   return visible.sort((a, b) => b.startedAt.localeCompare(a.startedAt));

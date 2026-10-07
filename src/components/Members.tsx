@@ -1,10 +1,11 @@
 import { useRef, useState } from 'react';
-import { Check, Copy, Download, Link, LoaderCircle, LogOut, MonitorSmartphone, RotateCcw, Search, UserX, X } from 'lucide-react';
-import type { AppState, CreatedInvitationLink, InvitationLink, Role, User } from '../../shared/types';
-import { api, json } from '../api';
+import { ArrowLeftRight, Check, Copy, Download, Link, LoaderCircle, LogOut, MonitorSmartphone, RotateCcw, Save, Search, UserX, X } from 'lucide-react';
+import type { AppState, CreatedInvitationLink, FamilyInfo, FamilySummary, InvitationLink, Role, User } from '../../shared/types';
+import { api, download, json } from '../api';
 import { Avatar, formatDate, Modal } from './ui';
 import { ServerStatusSummary } from './ServerStatus';
 import './Members.css';
+import './Families.css';
 
 interface MembersProps {
   state: AppState;
@@ -14,12 +15,16 @@ interface MembersProps {
   onLogout: () => Promise<void>;
   /** Called after "sign out everywhere": this device's session is gone as well. */
   onSessionEnded: () => void;
+  /** Opens the family picker. */
+  onSwitchFamily: () => void;
+  /** The family name or surnames changed: refresh the list of families. */
+  onFamilyChanged: () => Promise<void>;
 }
 const roleNames: Record<Role, string> = { admin: 'Администратор', member: 'Участник', viewer: 'Наблюдатель' };
 const message = (error: unknown) => error instanceof Error ? error.message : 'Не удалось выполнить действие. Попробуйте ещё раз.';
 const active = (user: User) => !user.status || user.status === 'active';
 
-export default function Members({ state, onClose, onRefresh, onMatchSelf, onLogout, onSessionEnded }: MembersProps) {
+export default function Members({ state, onClose, onRefresh, onMatchSelf, onLogout, onSessionEnded, onSwitchFamily, onFamilyChanged }: MembersProps) {
   const admin = state.user.role === 'admin';
   const [guestRole, setGuestRole] = useState<'member' | 'viewer'>('member');
   const [approvalRoles, setApprovalRoles] = useState<Record<string, 'member' | 'viewer'>>({});
@@ -27,7 +32,8 @@ export default function Members({ state, onClose, onRefresh, onMatchSelf, onLogo
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [created, setCreated] = useState<{ context: string; value: CreatedInvitationLink } | null>(null);
   const lock = useRef(false);
-  const invitationUrl = `${window.location.origin}/?join=1`;
+  const familyName = state.family?.name || state.settings.name;
+  const surnames = state.family?.surnames ?? state.settings.surnames ?? [];
   const applicants = admin ? state.users.filter(user => user.status === 'profile' || user.status === 'pending') : [];
   const rejected = admin ? state.users.filter(user => user.status === 'rejected') : [];
   const removed = admin ? state.users.filter(user => user.status === 'removed') : [];
@@ -69,14 +75,25 @@ export default function Members({ state, onClose, onRefresh, onMatchSelf, onLogo
   function createdFor(context: string) {
     if (created?.context !== context) return null;
     const link = created.value;
-    return <div className="members-created-link"><CopyLink key={link.invitation.id} url={`${window.location.origin}/#guest=${link.token}`} label="Гостевая ссылка" showUrl /><p>Действует до {formatDate(link.invitation.expiresAt)} Скопируйте её сейчас: после закрытия окна можно будет создать новую.</p></div>;
+    return <div className="members-created-link"><CopyLink key={link.invitation.id} url={`${window.location.origin}/#guest=${link.token}`} label="Ссылка-приглашение" showUrl /><p>Действует до {formatDate(link.invitation.expiresAt)} Скопируйте её сейчас: после закрытия окна можно будет создать новую.</p></div>;
   }
 
-  return <Modal open title="Участники пространства" onClose={onClose} wide>
+  async function exportData() {
+    if (lock.current) return;
+    lock.current = true; setBusy('export'); setErrors(current => ({ ...current, export: '' }));
+    try { await download('/api/export', 'family-space.json'); }
+    catch (error) { setErrors(current => ({ ...current, export: message(error) })); }
+    finally { lock.current = false; setBusy(''); }
+  }
+
+  return <Modal open title="Участники семьи" onClose={onClose} wide>
     <div className="members-content">
+      <div className="members-family"><div><strong>{familyName}</strong><small>{roleNames[state.user.role]}</small></div><button type="button" className="members-text-button" disabled={!!busy} onClick={onSwitchFamily}><ArrowLeftRight size={15} />Сменить семью</button></div>
       <section className="members-invite" aria-labelledby="members-invite-title">
-        <div><h3 id="members-invite-title">Пригласить родственника</h3>{!!state.settings.surnames?.length && <p className="members-invite-surnames">{state.settings.surnames.join(' · ')}</p>}<p>Родственник войдёт через Telegram, укажет ФИО и телефон. Администратор одобрит доступ.</p></div>
-        <CopyLink url={invitationUrl} label="Приглашение" actionLabel="Скопировать приглашение" primary />
+        <div><h3 id="members-invite-title">Пригласить родственника</h3>{surnames.length > 0 && <p className="members-invite-surnames">{surnames.join(' · ')}</p>}<p>{admin ? 'Создайте ссылку-приглашение и отправьте её родственнику. По ней он попадёт именно в эту семью — через Telegram или без него.' : 'Приглашения создаёт администратор семьи. Попросите его прислать ссылку родственнику.'}</p></div>
+        {admin && <div className="members-guest-actions"><label className="field">Доступ<select disabled={!!busy} value={guestRole} onChange={event => setGuestRole(event.target.value as 'member' | 'viewer')}><option value="member">Участник — добавляет и подтверждает</option><option value="viewer">Наблюдатель — только смотрит</option></select></label><button type="button" className="button primary" disabled={!!busy} onClick={() => createGuest('guest')}>{busy === 'guest' ? <LoaderCircle size={16} className="spin" /> : <Link size={16} />}Создать приглашение</button></div>}
+        {admin && <p className="members-secondary-note">Ссылка действует 7 дней и используется один раз.</p>}
+        {createdFor('guest')}{errorFor('guest')}
         {state.settings.devMode && <p className="members-local-note">Сейчас это локальный адрес. Для входа с другого устройства приложение нужно разместить на сервере.</p>}
       </section>
 
@@ -115,24 +132,26 @@ export default function Members({ state, onClose, onRefresh, onMatchSelf, onLogo
         })}</div>
       </section>
 
+      {admin && state.family && <FamilySettings family={state.family} onSaved={async () => { await onRefresh(); await onFamilyChanged(); }} />}
+
       {admin && <ServerStatusSummary settings={state.settings} />}
 
       {admin && <>
-        <details className="members-disclosure"><summary>Для тех, у кого нет Telegram</summary><div className="members-disclosure-content"><p>Создайте одноразовую ссылку для гостевого входа. После заполнения ФИО и телефона родственник получит выбранный доступ.</p><div className="members-guest-actions"><label className="field">Доступ<select disabled={!!busy} value={guestRole} onChange={event => setGuestRole(event.target.value as 'member' | 'viewer')}><option value="member">Участник — добавляет и подтверждает</option><option value="viewer">Наблюдатель — только смотрит</option></select></label><button type="button" className="button secondary" disabled={!!busy} onClick={() => createGuest('guest')}>{busy === 'guest' ? <LoaderCircle size={16} className="spin" /> : <Link size={16} />}Создать гостевую ссылку</button></div><p className="members-secondary-note">Ссылка действует 7 дней и используется один раз.</p>{createdFor('guest')}{errorFor('guest')}
-          {links.length > 0 && <div className="members-links"><h4>Созданные ссылки</h4>{links.map(link => {
+        {links.length > 0 && <details className="members-disclosure"><summary>Созданные приглашения · {links.length}</summary><div className="members-disclosure-content">
+          <div className="members-links">{links.map(link => {
             const context = `link-${link.id}`;
             const status = linkStatus(link);
             const owner = link.userId ? state.users.find(user => user.id === link.userId) : null;
-            return <article className="members-link-row" key={link.id}><div><strong>{owner ? `Вход: ${owner.name}` : `Гостевой доступ · ${roleNames[link.role]}`}</strong><small>Создана {formatDate(link.createdAt)} · {status === 'Действует' ? `до ${formatDate(link.expiresAt)}` : status}</small></div>{status === 'Действует' && <button type="button" className="members-text-button" disabled={!!busy} onClick={() => void mutate(context, async () => { await api(`/api/guest-links/${encodeURIComponent(link.id)}/revoke`, json('POST', {})); if (created?.value.invitation.id === link.id) setCreated(null); })}>Отозвать</button>}{errorFor(context)}</article>;
-          })}</div>}
-        </div></details>
+            return <article className="members-link-row" key={link.id}><div><strong>{owner ? `Вход: ${owner.name}` : `Приглашение · ${roleNames[link.role]}`}</strong><small>Создана {formatDate(link.createdAt)} · {status === 'Действует' ? `до ${formatDate(link.expiresAt)}` : status}</small></div>{status === 'Действует' && <button type="button" className="members-text-button" disabled={!!busy} onClick={() => void mutate(context, async () => { await api(`/api/guest-links/${encodeURIComponent(link.id)}/revoke`, json('POST', {})); if (created?.value.invitation.id === link.id) setCreated(null); })}>Отозвать</button>}{errorFor(context)}</article>;
+          })}</div>
+        </div></details>}
         {state.invitations.length > 0 && <details className="members-disclosure"><summary>Ранее приглашены по email</summary><div className="members-disclosure-content">{state.invitations.map(invitation => <div className="members-legacy-row" key={invitation.id}><strong>{invitation.email}</strong><span>{roleNames[invitation.role]} · {invitation.accepted ? 'Вошёл в пространство' : 'Ещё не вошёл'}</span></div>)}</div></details>}
         {removed.length > 0 && <details className="members-disclosure"><summary>Доступ закрыт · {removed.length}</summary><div className="members-disclosure-content">{removed.map(user => {
           const context = `removed-${user.id}`;
           return <article className="members-removed-row" key={user.id}><div className="members-person-main"><Avatar name={user.name} size={36} /><div><strong>{user.name || 'Участник'}</strong><small><span className="members-removed-label">Доступ закрыт</span>{user.phone ? ` · ${user.phone}` : ''}</small></div></div><button type="button" className="members-text-button" disabled={!!busy} onClick={() => void mutate(context, () => api(`/api/users/${encodeURIComponent(user.id)}/reactivate`, json('POST', {})))}>{busy === context ? <LoaderCircle size={15} className="spin" /> : <RotateCcw size={15} />}Вернуть доступ</button>{errorFor(context)}</article>;
         })}<p className="members-secondary-note">Добавленные ими материалы и сведения остаются в архиве.</p></div></details>}
         {rejected.length > 0 && <details className="members-disclosure"><summary>Отклонённые заявки · {rejected.length}</summary><div className="members-disclosure-content">{rejected.map(user => <div className="members-legacy-row" key={user.id}><strong>{user.name}</strong><span>{user.phone || 'Доступ не открыт'}</span></div>)}</div></details>}
-        <a href="/api/export" className="members-text-button members-export"><Download size={16} />Скачать данные пространства</a>
+        <button type="button" className="members-text-button members-export" disabled={!!busy} onClick={() => void exportData()}>{busy === 'export' ? <LoaderCircle size={16} className="spin" /> : <Download size={16} />}Скачать данные семьи</button>{errorFor('export')}
       </>}
       <div className="members-disclosure"><button type="button" className="members-text-button" disabled={!!busy} onClick={() => void onLogout()}><LogOut size={16} />Выйти</button></div>
     </div>
@@ -159,4 +178,52 @@ function CopyLink({ url, label, actionLabel = 'Скопировать ссылк
     finally { setCopying(false); }
   }
   return <div className="members-copy-link">{(showUrl || error) && <label className="field">{label}<input value={url} readOnly onFocus={event => event.target.select()} aria-label={label} /></label>}<button type="button" className={`button ${primary ? 'primary' : 'secondary'}`} disabled={copying} onClick={() => void copy()}>{copied ? <Check size={17} /> : <Copy size={17} />}{copied ? 'Ссылка скопирована' : actionLabel}</button>{error && <p className="members-copy-error" role="alert">{error}</p>}</div>;
+}
+
+const MAX_SURNAMES = 5;
+function formatBytes(bytes: number) {
+  const units = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'];
+  let value = bytes; let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return `${new Intl.NumberFormat('ru', { maximumFractionDigits: unit < 2 ? 0 : 1 }).format(value)} ${units[unit]}`;
+}
+
+/** Admin-only: family name, public surnames shown on invitations, storage used. */
+function FamilySettings({ family, onSaved }: { family: FamilyInfo; onSaved: () => Promise<void> }) {
+  const [name, setName] = useState(family.name);
+  const [surnames, setSurnames] = useState(family.surnames.join(', '));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [saved, setSaved] = useState(false);
+  const list = surnames.split(/[,;\n]/).map(item => item.trim()).filter(Boolean);
+  const tooMany = list.length > MAX_SURNAMES;
+  const dirty = name.trim() !== family.name || list.join('\n') !== family.surnames.join('\n');
+  async function save(event: React.FormEvent) {
+    event.preventDefault();
+    if (busy || !name.trim() || tooMany || !dirty) return;
+    setBusy(true); setError(''); setSaved(false);
+    try {
+      await api<FamilySummary>(`/api/families/${encodeURIComponent(family.id)}`, json('PATCH', { name: name.trim(), surnames: list }));
+      setSaved(true);
+      try { await onSaved(); } catch { setError('Изменения сохранены, но экран не обновился. Обновите страницу.'); }
+    } catch (e) { setError(message(e)); }
+    finally { setBusy(false); }
+  }
+  const limit = family.storageLimitBytes;
+  const percent = limit ? Math.min(100, Math.round(family.storageBytes / limit * 100)) : 0;
+  return <section className="members-section members-settings" aria-labelledby="members-settings-title">
+    <div className="members-section-heading"><h3 id="members-settings-title">Настройки семьи</h3></div>
+    <form className="form-stack" onSubmit={save}>
+      <label className="field">Название семьи<input required maxLength={120} value={name} disabled={busy} onChange={event => { setName(event.target.value); setSaved(false); }} /></label>
+      <label className="field">Фамилии в приглашении<input value={surnames} disabled={busy} placeholder="Ивановы, Петровы" aria-describedby="members-surnames-hint" onChange={event => { setSurnames(event.target.value); setSaved(false); }} /></label>
+      <p id="members-surnames-hint" className={tooMany ? 'error-message' : 'form-hint'}>{tooMany ? `Можно указать не больше ${MAX_SURNAMES} фамилий.` : `До ${MAX_SURNAMES} фамилий через запятую. Их увидит родственник, открывший приглашение.`}</p>
+      {error && <p className="error-message" role="alert">{error}</p>}
+      {saved && !error && <p className="form-hint" role="status">Сохранено.</p>}
+      <div><button type="submit" className="button secondary" disabled={busy || !name.trim() || tooMany || !dirty}>{busy ? <LoaderCircle size={16} className="spin" /> : <Save size={16} />}Сохранить</button></div>
+    </form>
+    <div className="members-storage">
+      <span>Файлы семьи занимают {formatBytes(family.storageBytes)}{limit ? ` из ${formatBytes(limit)}` : ''}</span>
+      {!!limit && <div className="members-storage-bar" role="progressbar" aria-label="Занятое место" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}><span style={{ width: `${percent}%` }} /></div>}
+    </div>
+  </section>;
 }

@@ -42,7 +42,7 @@ export function SaveCopyActions({ file, url, className = 'archive-recorder-copy'
 }
 
 /** Keeps a list of this user's unsaved recordings in sync with IndexedDB and other tabs. */
-export function useUnsavedRecordings(userId: string | undefined) {
+export function useUnsavedRecordings(userId: string | undefined, familyId?: string) {
   const [items, setItems] = useState<RecordingSession[]>([]);
   const [available, setAvailable] = useState(true);
   useEffect(() => {
@@ -51,7 +51,7 @@ export function useUnsavedRecordings(userId: string | undefined) {
       if (running) { again = true; return; }
       running = true;
       try {
-        const all = await listRecordings(userId);
+        const all = await listRecordings(userId, familyId);
         if (cancelled) return;
         setAvailable(true);
         setItems(all.filter(item => !isRecordingElsewhere(item)));
@@ -66,13 +66,13 @@ export function useUnsavedRecordings(userId: string | undefined) {
     const visible = () => { if (document.visibilityState === 'visible') void refresh(); };
     document.addEventListener('visibilitychange', visible);
     return () => { cancelled = true; window.clearTimeout(recheck); unsubscribe(); document.removeEventListener('visibilitychange', visible); };
-  }, [userId]);
+  }, [userId, familyId]);
   return { items, available };
 }
 
 /** App-level reminder that a recording never reached the archive and exists only on this device. */
-export function UnsavedRecordings({ userId }: { userId: string }) {
-  const { items } = useUnsavedRecordings(userId);
+export function UnsavedRecordings({ userId, familyId }: { userId: string; familyId?: string }) {
+  const { items } = useUnsavedRecordings(userId, familyId);
   const [open, setOpen] = useState(false);
   const [hiddenFor, setHiddenFor] = useState('');
   const signature = items.map(item => item.id).join(',');

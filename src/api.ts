@@ -6,7 +6,33 @@ export type ApiErrorKind = 'http' | 'network' | 'format' | 'cancelled' | 'stalle
 export class ApiError extends Error {
   readonly status: number;
   readonly kind: ApiErrorKind;
-  constructor(message: string, status: number, kind: ApiErrorKind = 'http') { super(message); this.name = 'ApiError'; this.status = status; this.kind = kind; }
+  /** Machine-readable reason from the server, e.g. 'family_required' or 'not_member'. */
+  readonly code?: string;
+  constructor(message: string, status: number, kind: ApiErrorKind = 'http', code?: string) { super(message); this.name = 'ApiError'; this.status = status; this.kind = kind; this.code = code; }
+}
+
+/* ---- current family: every family-scoped request carries X-Family-Id ---- */
+const FAMILY_KEY = 'family-memory:family:v1';
+let currentFamilyId: string | null = null;
+const familyLostListeners = new Set<(familyId: string | null) => void>();
+export function getCurrentFamily() { return currentFamilyId; }
+export function setCurrentFamily(id: string | null) { currentFamilyId = id; }
+/** The family last opened by this person on this device. */
+export function lastFamily(userId: string): string | null { try { return localStorage.getItem(`${FAMILY_KEY}:${userId}`); } catch { return null; } }
+export function rememberFamily(userId: string, familyId: string | null) {
+  try { if (familyId) localStorage.setItem(`${FAMILY_KEY}:${userId}`, familyId); else localStorage.removeItem(`${FAMILY_KEY}:${userId}`); } catch { /* remembered for this page only */ }
+}
+/** Called when the server says the current family is missing or not ours; the app shows the family chooser. */
+export function onFamilyLost(listener: (familyId: string | null) => void): () => void { familyLostListeners.add(listener); return () => { familyLostListeners.delete(listener); }; }
+const FAMILY_CODES = new Set(['family_required', 'not_member']);
+function familyHeaders(): Record<string, string> { return currentFamilyId ? { 'X-Family-Id': currentFamilyId } : {}; }
+function checkFamilyError(status: number, value: unknown): string | undefined {
+  const code = value && typeof value === 'object' && typeof (value as { code?: unknown }).code === 'string' ? (value as { code: string }).code : undefined;
+  if (code && FAMILY_CODES.has(code) && (status === 400 || status === 403 || status === 404)) {
+    const lost = currentFamilyId;
+    for (const listener of [...familyLostListeners]) listener(lost);
+  }
+  return code;
 }
 
 const KEPT = 'файл остался на устройстве';
@@ -35,14 +61,17 @@ function serverMessage(value: unknown): string | null {
 export function json(method: string, body: unknown): RequestInit { return { method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) }; }
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   let response: Response;
-  try { response = await fetch(path, { ...options, credentials:'same-origin', headers:{'X-Requested-With':'family-space',...options.headers} }); }
+  try { response = await fetch(path, { ...options, credentials:'same-origin', headers:{'X-Requested-With':'family-space',...familyHeaders(),...options.headers} }); }
   catch (cause) {
     if (cause instanceof DOMException && cause.name === 'AbortError') throw cause;
     throw new ApiError(statusMessage(0, false)!, 0, 'network');
   }
   const text = await response.text().catch(() => '');
   const value = parse(text);
-  if (!response.ok) throw new ApiError(serverMessage(value) || statusMessage(response.status, false) || `Не удалось выполнить действие (ошибка ${response.status}). Попробуйте ещё раз.`, response.status);
+  if (!response.ok) {
+    const code = checkFamilyError(response.status, value);
+    throw new ApiError(serverMessage(value) || statusMessage(response.status, false) || `Не удалось выполнить действие (ошибка ${response.status}). Попробуйте ещё раз.`, response.status, 'http', code);
+  }
   if (response.status === 204) return undefined as T;
   // A 2xx page that is not JSON is usually a proxy login page or the app shell: never report it as success.
   if (value === undefined) throw new ApiError('Сервер ответил неожиданно — возможно, истёк вход или мешает прокси. Обновите страницу и попробуйте ещё раз.', response.status, 'format');
@@ -82,6 +111,7 @@ export function upload(file: File, options: UploadOptions | ((percent: number) =
     };
     xhr.open('POST', '/api/files');
     xhr.setRequestHeader('X-Requested-With', 'family-space');
+    for (const [name, value] of Object.entries(familyHeaders())) xhr.setRequestHeader(name, value);
     xhr.withCredentials = true;
     xhr.upload.onprogress = event => { lastActivity = Date.now(); if (event.lengthComputable && event.total > 0) onProgress?.(Math.min(100, Math.round(event.loaded / event.total * 100))); };
     xhr.upload.onload = () => { sent = true; lastActivity = Date.now(); onProgress?.(100); };
@@ -94,9 +124,29 @@ export function upload(file: File, options: UploadOptions | ((percent: number) =
         else reject(new ApiError(uploadMessages.format, xhr.status, 'format'));
         return;
       }
-      reject(new ApiError(serverMessage(data) || statusMessage(xhr.status, true) || `Не удалось загрузить файл (ошибка ${xhr.status}); ${KEPT}.`, xhr.status));
+      const code = checkFamilyError(xhr.status, data);
+      reject(new ApiError(serverMessage(data) || statusMessage(xhr.status, true) || `Не удалось загрузить файл (ошибка ${xhr.status}); ${KEPT}.`, xhr.status, 'http', code));
     });
     const form = new FormData(); form.append('file', file);
     try { xhr.send(form); } catch { settle(() => reject(new ApiError(uploadMessages.network, 0, 'network'))); }
   });
+}
+
+/** Downloads a family-scoped file (e.g. the export) with the family header, which a plain link cannot send. */
+export async function download(path: string, fallbackName: string): Promise<void> {
+  let response: Response;
+  try { response = await fetch(path, { credentials: 'same-origin', headers: { 'X-Requested-With': 'family-space', ...familyHeaders() } }); }
+  catch { throw new ApiError(statusMessage(0, false)!, 0, 'network'); }
+  if (!response.ok) {
+    const value = parse(await response.text().catch(() => ''));
+    const code = checkFamilyError(response.status, value);
+    throw new ApiError(serverMessage(value) || statusMessage(response.status, false) || `Не удалось скачать файл (ошибка ${response.status}).`, response.status, 'http', code);
+  }
+  const blob = await response.blob();
+  const name = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(response.headers.get('Content-Disposition') || '')?.[1];
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url; link.download = name ? decodeURIComponent(name) : fallbackName;
+  document.body.appendChild(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
 }

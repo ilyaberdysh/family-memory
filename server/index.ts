@@ -25,12 +25,14 @@ function assertPersistentDataDirectory(directory: string) {
 }
 const dataDir = process.env.DATA_DIR ?? join(process.cwd(), 'data');
 assertPersistentDataDirectory(dataDir);
-const newDatabase = !existsSync(join(dataDir, 'family.sqlite'));
-const runtime = createApp({ bindHost: host, production });
+const newDatabase = !process.env.DATABASE_URL && !existsSync(join(dataDir, 'pglite'));
+if (newDatabase && existsSync(join(dataDir, 'family.sqlite')) && !process.env.DATABASE_URL) console.warn('Найдена прежняя база family.sqlite: перенесите её командой scripts/import-sqlite (см. DEPLOYMENT.md).');
+const runtime = await createApp({ bindHost: host, production });
 {
-  const count = (table: string) => (runtime.store.db.prepare(`SELECT count(*) AS n FROM ${table}`).get() as { n: number }).n;
+  const counts = await runtime.db.system(g => g.raw('SELECT (SELECT count(*) FROM families) AS families, (SELECT count(*) FROM users) AS users, (SELECT count(*) FROM people) AS people, (SELECT count(*) FROM materials) AS materials, (SELECT count(*) FROM files) AS files'));
+  const n = counts[0];
   // Visible in deploy logs: an unexpectedly empty archive is noticed at the first start, not months later.
-  console.log(`Данные: ${resolve(dataDir)}${newDatabase ? ' (создана новая пустая база)' : ''}. Участников: ${count('users')}, людей: ${count('people')}, материалов: ${count('materials')}, файлов: ${count('files')}.`);
+  console.log(`Данные: ${runtime.db.kind === 'postgres' ? 'PostgreSQL' : resolve(dataDir, 'pglite')}; файлы: ${resolve(dataDir, 'files')}. Семей: ${n.families}, аккаунтов: ${n.users}, людей: ${n.people}, материалов: ${n.materials}, файлов: ${n.files}.`);
 }
 if (production) {
   runtime.app.use((_req, res, next) => {
