@@ -2,9 +2,11 @@ import { readFileSync } from 'node:fs';
 import { lstat, readdir, realpath, rm } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import type { BackupStatus } from '../shared/types.js';
-import { createBackup, formatBytes, IN_PROGRESS_MARKER, problemFileCount, readManifest, STATUS_FILE, type BackupStatusFile } from '../scripts/backup.mjs';
+import type { Database } from './db.js';
+import { createBackup, formatBytes, IN_PROGRESS_MARKER, problemFileCount, readManifest, STATUS_FILE, type BackupStatusFile } from '../scripts/backup.mts';
 
-export interface BackupSchedulerOptions { dataDir: string; backupDir?: string; intervalHours?: number; keep?: number; firstDelayMs?: number; log?: (message: string) => void }
+/** `db` is the application's own instance: an embedded PGlite database cannot be opened by a second process while the app runs. */
+export interface BackupSchedulerOptions { db: Database; dataDir: string; backupDir?: string; intervalHours?: number; keep?: number; firstDelayMs?: number; log?: (message: string) => void }
 export interface BackupScheduler { status(): BackupStatus; runNow(): Promise<void>; close(): Promise<void> }
 
 const HOUR = 3_600_000;
@@ -104,10 +106,10 @@ export function startBackupScheduler(options: BackupSchedulerOptions): BackupSch
     const started = Date.now();
     try {
       const linkDest = await newestComplete(directory);
-      const result = await createBackup(dataDir, await freeDestination(directory), { linkDest, signal: abort.signal, warn: log });
+      const result = await createBackup({ db: options.db, dataDir, destination: await freeDestination(directory), linkDest, signal: abort.signal, warn: log });
       const problems = problemFileCount(result.problems);
       const name = result.destination.split(sep).pop();
-      log(`Backup ${problems ? 'DEGRADED' : 'complete'}: ${name}, ${result.files} files, copied ${formatBytes(result.bytesCopied)}, linked ${formatBytes(result.bytesLinked)}, ${Math.round((Date.now() - started) / 1000)} s${problems ? `; ${problems} file(s) missing or damaged in DATA_DIR, see manifest.json` : ''}.`);
+      log(`Backup ${problems ? 'DEGRADED' : 'complete'}: ${name}, ${result.families} families, ${result.rows} rows, ${result.files} files, copied ${formatBytes(result.bytesCopied)}, linked ${formatBytes(result.bytesLinked)}, ${Math.round((Date.now() - started) / 1000)} s${problems ? `; ${problems} file(s) missing or damaged in DATA_DIR, see manifest.json` : ''}.`);
       try { await prune(directory, result.destination); } catch (error) { log(`Backup rotation failed: ${message(error)}`); }
     } catch (error) {
       log(abort.signal.aborted ? 'Backup interrupted by shutdown; the incomplete snapshot was removed.' : `Backup FAILED: ${message(error)}`);

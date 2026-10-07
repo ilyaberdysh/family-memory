@@ -6,7 +6,7 @@ import { Avatar, DraftNote, formatDate, Modal } from './ui';
 import Recorder from './Recorder';
 import { PreviewNote, mediaSrc, originalHref, previewFailed, previewPending } from './media';
 import { forgetRecording, recordingIdOf } from '../recording-store';
-import { clearDraft, draftKey, readDraft, useDraft } from '../drafts';
+import { clearDraft, draftKey, readDraft, useDraft, writeDraft } from '../drafts';
 import { FamilyDateField } from './PeopleForms';
 import ProposalReview from './ProposalReview';
 import { dateInputError, formatFamilyDate } from '../../shared/person-fields';
@@ -24,7 +24,16 @@ const photoAccept = 'image/jpeg,image/png,image/webp,image/gif,image/heic,image/
 const audioAccept = 'audio/*,.m4a,.ogg,.webm,.amr,.aiff,.aif,.wma';
 const videoAccept = 'video/*,.mts,.m2ts,.vob,.mpg,.avi,.wmv,.3gp,.mkv';
 interface MaterialDraft { kind: MaterialKind; title: string; body: string; narrator: string; occurredAt: string; personIds: string[] }
-const newMaterialDraftKey = (userId: string) => draftKey(userId, 'material', 'new');
+/** New-material drafts belong to one family; a draft saved before families existed moves to the first family opened. */
+const newMaterialDraftKey = (userId: string, familyId?: string) => familyId ? draftKey(userId, 'material', 'new', familyId) : draftKey(userId, 'material', 'new');
+function adoptLegacyMaterialDraft(userId: string, familyId?: string) {
+  if (!familyId) return;
+  const target = newMaterialDraftKey(userId, familyId);
+  const legacyKey = newMaterialDraftKey(userId);
+  const legacy = readDraft<MaterialDraft>(legacyKey);
+  if (!legacy || readDraft<MaterialDraft>(target)) return;
+  if (writeDraft(target, legacy)) clearDraft(legacyKey);
+}
 const busyStatus = (status: string) => status === 'queued' || status === 'processing';
 function timestamp(seconds: number) { return `${Math.floor(seconds / 60)}:${Math.floor(seconds % 60).toString().padStart(2, '0')}`; }
 function useUnsaved(dirty: boolean) {
@@ -132,8 +141,8 @@ const draftIsEmpty = (value: MaterialDraft) => !value.title.trim() && !value.bod
 
 function MaterialForm({ state, material, initialKind = 'story', initialPersonId, closeWarning, onDirtyChange, onBusyChange, onCancel, onSaved }: MaterialFormProps) {
   // Only new materials keep a draft; edits of an existing material are compared with the server copy instead.
-  const storageKey = material ? null : newMaterialDraftKey(state.user.id);
-  const [restored] = useState(() => { const value = readDraft<MaterialDraft>(storageKey); return value && typeof value.title === 'string' && !draftIsEmpty(value) ? value : null; });
+  const storageKey = material ? null : newMaterialDraftKey(state.user.id, state.family?.id);
+  const [restored] = useState(() => { if (!material) adoptLegacyMaterialDraft(state.user.id, state.family?.id); const value = readDraft<MaterialDraft>(storageKey); return value && typeof value.title === 'string' && !draftIsEmpty(value) ? value : null; });
   const [restoredNote, setRestoredNote] = useState(!!restored);
   const defaultPeople = initialPersonId ? [initialPersonId] : [];
   const restoredPeople = (restored?.personIds || []).filter(id => state.people.some(person => person.id === id));
@@ -206,7 +215,7 @@ function MaterialForm({ state, material, initialKind = 'story', initialPersonId,
       <label className="field">Название<input autoFocus required maxLength={240} value={title} onChange={event => setTitle(event.target.value)} placeholder="Как назовём эту историю?" /></label>
       {!material && kind !== 'story' && <div className="archive-file-area">
         {kind === 'audio' && <div className="archive-source-toggle" role="group" aria-label="Как добавить аудио"><button type="button" className={audioSource === 'file' ? 'selected' : ''} disabled={recording} onClick={() => { if (audioSource === 'file') return; if (audioSource === 'record' && file && !window.confirm(`Перейти к загрузке файла? ${removedFromForm}`)) return; setAudioSource('file'); chooseFile(null); }}>Загрузить файл</button><button type="button" className={audioSource === 'record' ? 'selected' : ''} disabled={recording} onClick={() => { if (audioSource === 'record') return; if (audioSource === 'file' && file && !window.confirm('Перейти к диктофону? Выбранный файл будет убран из формы.')) return; setAudioSource('record'); chooseFile(null); }}>Записать сейчас</button></div>}
-        {kind === 'audio' && audioSource === 'record' ? <Recorder onRecorded={chooseFile} onActiveChange={setRecording} disabled={saving} userId={state.user.id} context={`Архив · ${title.trim() || 'новый материал'}`} /> : <label className="archive-upload"><Upload size={25} /><strong>{file ? file.name : 'Выберите файл'}</strong><span>{file ? `${(file.size / 1024 / 1024).toFixed(1)} МБ · нажмите, чтобы заменить` : `${kinds[kind].label} · до ${state.settings.maxUploadMb} МБ`}</span><input type="file" accept={kind === 'photo' ? photoAccept : kind === 'audio' ? audioAccept : videoAccept} onChange={event => chooseFile(event.target.files?.[0] || null)} /></label>}
+        {kind === 'audio' && audioSource === 'record' ? <Recorder onRecorded={chooseFile} onActiveChange={setRecording} disabled={saving} userId={state.user.id} familyId={state.family?.id} context={`Архив · ${title.trim() || 'новый материал'}`} /> : <label className="archive-upload"><Upload size={25} /><strong>{file ? file.name : 'Выберите файл'}</strong><span>{file ? `${(file.size / 1024 / 1024).toFixed(1)} МБ · нажмите, чтобы заменить` : `${kinds[kind].label} · до ${state.settings.maxUploadMb} МБ`}</span><input type="file" accept={kind === 'photo' ? photoAccept : kind === 'audio' ? audioAccept : videoAccept} onChange={event => chooseFile(event.target.files?.[0] || null)} /></label>}
       </div>}
       <label className="field">{kind === 'story' ? 'История' : 'Описание'}<textarea rows={kind === 'story' ? 7 : 3} value={body} onChange={event => setBody(event.target.value)} placeholder={kind === 'story' ? 'Запишите, как всё было. Можно сохранить и совсем короткое воспоминание.' : 'Что происходит в записи или на фотографии? Необязательно.'} /></label>
       {!material && kind === 'story' && <details className="archive-story-attachment"><summary><Camera size={16} />Добавить фотографию к истории</summary><label className="archive-upload"><Upload size={23} /><strong>{file?.name || 'Выберите фотографию'}</strong><span>Необязательно · до {state.settings.maxUploadMb} МБ</span><input type="file" accept={photoAccept} onChange={event => chooseFile(event.target.files?.[0] || null)} /></label>{file && <button type="button" className="archive-text-button" onClick={() => chooseFile(null)}><X size={14} />Убрать фотографию</button>}</details>}

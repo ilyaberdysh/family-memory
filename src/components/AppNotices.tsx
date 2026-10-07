@@ -16,7 +16,7 @@ export default function AppNotices({ state, onOpenMembers }: { state: AppState; 
     return () => observer.disconnect();
   }, []);
   return <div ref={container} className="app-notices">
-    <UnsavedRecordings userId={state.user.id} />
+    <UnsavedRecordings userId={state.user.id} familyId={state.family?.id} />
     {state.user.role === 'admin' && <AdminStatusBanner settings={state.settings} onOpen={onOpenMembers} />}
   </div>;
 }

@@ -9,6 +9,8 @@ interface Props {
   disabled?: boolean;
   /** Scopes the device copy so relatives sharing a phone only see their own unsaved recordings. */
   userId?: string;
+  /** Scopes the device copy to the family it was recorded for. */
+  familyId?: string;
   /** Where the recording was made, shown if it has to be recovered later. */
   context?: string;
 }
@@ -16,7 +18,7 @@ interface Props {
 const BACKUP_UNAVAILABLE = 'Резервная копия на этом устройстве недоступна — запись хранится только на открытой странице. Не закрывайте её, пока запись не сохранена.';
 const MUTED = 'Микрофон перестал передавать звук — не блокируйте телефон и не переключайтесь в другие приложения.';
 
-export default function Recorder({ onRecorded, onActiveChange, disabled, userId, context = 'Запись' }: Props) {
+export default function Recorder({ onRecorded, onActiveChange, disabled, userId, familyId, context = 'Запись' }: Props) {
   const [status, setStatus] = useState<'idle' | 'requesting' | 'recording' | 'paused' | 'done'>('idle');
   const [seconds, setSeconds] = useState(0);
   const [error, setError] = useState('');
@@ -25,7 +27,7 @@ export default function Recorder({ onRecorded, onActiveChange, disabled, userId,
   const [gap, setGap] = useState(false);
   const [current, setCurrent] = useState<{ file: File; url: string } | null>(null);
   const [opening, setOpening] = useState('');
-  const { items: found } = useUnsavedRecordings(userId);
+  const { items: found } = useUnsavedRecordings(userId, familyId);
   const recorder = useRef<MediaRecorder | null>(null);
   const stream = useRef<MediaStream | null>(null);
   const sessionId = useRef<string | null>(null);
@@ -127,7 +129,7 @@ export default function Recorder({ onRecorded, onActiveChange, disabled, userId,
       recorder.current = next;
       // The person confirmed replacing the previous take; it was never saved, so remove it from the device too.
       if (previous) void forgetRecording(previous.file);
-      const backup: RecordingBackup = startRecordingBackup({ mimeType: next.mimeType || mimeType || '', userId, context }, () => { if (mounted.current) setBackupNote(BACKUP_UNAVAILABLE); });
+      const backup: RecordingBackup = startRecordingBackup({ mimeType: next.mimeType || mimeType || '', userId, familyId, context }, () => { if (mounted.current) setBackupNote(BACKUP_UNAVAILABLE); });
       sessionId.current = backup.id; backupRef.current = backup;
       const startedAt = new Date();
       const chunks: Blob[] = [];

@@ -26,8 +26,9 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/server ./server
 COPY --from=build /app/shared ./shared
-# The in-app backup scheduler imports scripts/backup.mjs; restore and verify are operator tools.
-COPY scripts/backup.mjs scripts/restore.mjs scripts/verify.mjs ./scripts/
+# The in-app backup scheduler imports scripts/backup.mts; restore, verify and import-sqlite are operator tools
+# run inside the container with node_modules/.bin/tsx. Backups are logical (NDJSON), so no pg_dump is needed.
+COPY --from=build /app/scripts ./scripts
 USER node
 EXPOSE 4317
 # No VOLUME instruction: the app refuses to start when DATA_DIR is on the container's ephemeral layer,

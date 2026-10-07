@@ -23,9 +23,9 @@ export interface Material { extractionRejectedCount?: number; relatedMaterialIds
 export interface Invitation { id: string; email: string; role: Role; createdAt: string; accepted: boolean }
 export interface InvitationLink { id: string; role: 'member' | 'viewer'; createdBy: string; createdAt: string; expiresAt: string; revokedAt: string | null; uses: number; userId?: string | null; usedAt?: string | null }
 export interface CreatedInvitationLink { invitation: InvitationLink; token: string }
-export interface InvitationPreview { role: 'member' | 'viewer'; expiresAt: string }
+export interface InvitationPreview { role: 'member' | 'viewer'; expiresAt: string; family?: { name: string; surnames: string[] } }
 export interface HistoryEntry { id: string; entityType: string; entityId: string; actorId: string; action: string; before: string | null; after: string | null; createdAt: string }
-export interface AppState { user: User; users: User[]; people: Person[]; facts: Fact[]; relations: Relation[]; materials: Material[]; invitations: Invitation[]; invitationLinks?: InvitationLink[]; settings: { name: string; surnames?: string[]; devMode: boolean; aiAvailable: boolean; maxUploadMb: number; backup?: BackupStatus | null; storage?: StorageStatus | null } }
+export interface AppState { family?: FamilyInfo; user: User; users: User[]; people: Person[]; facts: Fact[]; relations: Relation[]; materials: Material[]; invitations: Invitation[]; invitationLinks?: InvitationLink[]; settings: { name: string; surnames?: string[]; devMode: boolean; aiAvailable: boolean; maxUploadMb: number; backup?: BackupStatus | null; storage?: StorageStatus | null } }
 /** Admin-only operational view. `stale` means no complete backup within the expected interval. */
 export interface BackupStatus {
   automatic: boolean;
@@ -40,7 +40,12 @@ export interface BackupStatus {
 }
 export interface StorageStatus { freeBytes: number | null; totalBytes: number | null; low: boolean }
 export interface AuthConfig { devMode: boolean; mailAvailable: boolean; name: string; surnames?: string[]; telegramAvailable?: boolean }
-export interface AuthSession { user: User | null }
+export interface AuthSession { user: User | null; families?: FamilySummary[] }
+/** One family the signed-in account belongs to (status/role are the membership in that family). */
+export interface FamilySummary { id: string; name: string; role: Role; status: 'active' | 'pending' | 'removed' | 'rejected'; memberCount?: number }
+/** The family the current /api/state belongs to. storageLimitBytes null means no limit. */
+export interface FamilyInfo { id: string; name: string; surnames: string[]; storageBytes: number; storageLimitBytes: number | null }
+export interface GuestRedeemResult { user: User; familyId: string }
 
 
 export interface ConversationMessage {

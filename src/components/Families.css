@@ -1,0 +1,26 @@
+.family-list{display:flex;flex-direction:column;gap:8px}
+.family-row{display:flex;align-items:center;gap:12px;width:100%;min-height:58px;padding:12px 14px;text-align:left;background:white;border:1px solid #eee5dd;border-radius:13px;color:#2f3943;font-size:14px}
+button.family-row:hover{border-color:#bdc9d4;background:#fffaf4}
+button.family-row:focus-visible{outline:3px solid #315f8955;outline-offset:2px}
+.family-row.current{border-color:#9db4c9;background:#f6f9fc}
+.family-row>svg{flex-shrink:0;color:#6b7f93}
+.family-row-mark{display:grid;place-items:center;width:36px;height:36px;flex-shrink:0;border-radius:10px;background:#fcefe2;color:#315f89}
+.family-row-text{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
+.family-row-text strong{font-size:15px;font-weight:580;overflow-wrap:anywhere}
+.family-row-text small{font-size:12px;color:#82776c}
+.family-home .join-access{margin-top:4px}
+.family-switcher{display:flex;align-items:center;gap:6px;max-width:100%;min-height:36px;border:1px solid transparent;background:none;border-radius:9px;padding:6px 10px;font-size:12px;color:#7d7268;text-align:left}
+.family-switcher span{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.family-switcher svg{flex-shrink:0}
+.family-switcher:hover{background:#ede6df}
+.family-switcher:focus-visible{outline:3px solid #315f8955;outline-offset:1px}
+.sidebar .family-switcher{margin:14px 2px 13px;width:calc(100% - 4px)}
+.mobile-brand .family-switcher{font-size:17px;font-weight:600;color:#302921;padding:6px 4px;min-height:44px;min-width:0}
+.members-family{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding-bottom:4px}
+.members-family strong{font-size:15px;overflow-wrap:anywhere}
+.members-family small{display:block;font-size:12px;color:#82776c;margin-top:2px}
+.members-settings .form-stack{gap:12px}
+.members-storage{font-size:13px;color:#5f564d}
+.members-storage-bar{height:6px;border-radius:3px;background:#efe7df;overflow:hidden;margin-top:6px}
+.members-storage-bar span{display:block;height:100%;background:#315f89}
+@media(max-width:940px){.sidebar .family-switcher{display:none}}

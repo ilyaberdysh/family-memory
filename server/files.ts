@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { createWriteStream, statfsSync } from 'node:fs';
+import { createReadStream, createWriteStream, statfsSync } from 'node:fs';
 import { open, readdir, rename, stat, unlink, mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Transform } from 'node:stream';
@@ -65,12 +65,33 @@ export class DurableUploadStorage implements StorageEngine {
   }
 }
 
-/** Moves a validated upload into files/ and makes the new directory entry durable before any row references it. */
-export async function commitUpload(upload: StoredUpload, filesDir: string) {
-  const target = join(filesDir, upload.filename);
-  await rename(upload.path, target);
-  await fsyncDirectory(filesDir);
-  return upload.filename;
+/**
+ * Where a family's originals and browser copies live. Local disk today (files/<familyId>/<name>);
+ * an object-storage implementation (GCS/S3) only has to provide the same four operations.
+ */
+export interface BlobStore {
+  /** Moves a validated, fsynced staging file into the family's storage and returns its stored name. */
+  commit(upload: StoredUpload, familyId: string): Promise<string>;
+  /** A readable local path for ffmpeg/transcription (object storage would download to a temporary file). */
+  localPath(familyId: string, name: string): string;
+  read(familyId: string, name: string, range?: { start: number; end: number }): NodeJS.ReadableStream;
+  remove(familyId: string, name: string): Promise<void>;
+}
+const FAMILY_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const STORED_NAME = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,199}$/;
+export class LocalBlobStore implements BlobStore {
+  constructor(readonly root: string) {}
+  directory(familyId: string) { if (!FAMILY_ID.test(familyId)) throw new Error('Некорректный идентификатор семьи.'); return join(this.root, familyId); }
+  localPath(familyId: string, name: string) { if (!STORED_NAME.test(name)) throw new Error('Некорректное имя файла.'); return join(this.directory(familyId), name); }
+  async commit(upload: StoredUpload, familyId: string) {
+    const directory = this.directory(familyId);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await rename(upload.path, join(directory, upload.filename));
+    await fsyncDirectory(directory);
+    return upload.filename;
+  }
+  read(familyId: string, name: string, range?: { start: number; end: number }) { return createReadStream(this.localPath(familyId, name), range); }
+  async remove(familyId: string, name: string) { await unlink(this.localPath(familyId, name)).catch(() => {}); }
 }
 
 /** Leftovers in .incoming were never acknowledged to anyone; old ones are interrupted uploads. */
