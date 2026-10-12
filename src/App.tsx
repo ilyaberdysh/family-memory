@@ -5,6 +5,7 @@ import { AlbumView } from './components/AlbumView';
 import { Logo } from './components/Logo';
 import { TreeView } from './components/TreeView';
 import { useModelStatus } from './model-status';
+import { useTree } from './tree-state';
 
 export type Tab = 'agent' | 'tree' | 'album';
 
@@ -25,6 +26,8 @@ export function App() {
   const [conversationKey, setConversationKey] = useState(0);
   const [hasConversation, setHasConversation] = useState(false);
   const model = useModelStatus();
+  const treeApi = useTree();
+  const { refresh: refreshTree } = treeApi;
 
   useEffect(() => {
     const onHash = () => setTab(tabFromHash());
@@ -59,6 +62,7 @@ export function App() {
             <button key={id} className="segment" role="tab" aria-selected={tab === id} onClick={() => go(id)}>
               <Icon aria-hidden />
               {label}
+              {id === 'tree' && treeApi.tree.people.length > 0 && <span className="count">{treeApi.tree.people.length}</span>}
             </button>
           ))}
         </nav>
@@ -79,8 +83,8 @@ export function App() {
       </header>
 
       <main className="main">
-        {tab === 'agent' && <AgentView key={conversationKey} onActiveChange={setHasConversation} />}
-        {tab === 'tree' && <TreeView onStart={() => go('agent')} />}
+        {tab === 'agent' && <AgentView key={conversationKey} tree={treeApi.tree} onTreeChanged={refreshTree} onOpenTree={() => go('tree')} onActiveChange={setHasConversation} />}
+        {tab === 'tree' && <TreeView api={treeApi} onStart={() => go('agent')} />}
         {tab === 'album' && <AlbumView />}
       </main>
     </div>

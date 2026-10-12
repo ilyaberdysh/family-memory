@@ -5,6 +5,7 @@ import express from 'express';
 import type { UIMessage } from 'ai';
 import { streamAgentReply } from './agent.js';
 import { resolveModel } from './model.js';
+import { deletePerson, getTree, resetTree, undo } from './tree-store.js';
 
 const app = express();
 const server = http.createServer(app);
@@ -15,6 +16,26 @@ app.use(express.json({ limit: '2mb' }));
 
 app.get('/api/health', (_request, response) => {
   response.json({ model: resolveModel().status });
+});
+
+app.get('/api/tree', (_request, response) => {
+  response.json(getTree());
+});
+
+app.post('/api/tree/undo', (_request, response) => {
+  response.json(undo());
+});
+
+app.post('/api/tree/reset', (_request, response) => {
+  response.json(resetTree());
+});
+
+app.delete('/api/tree/people/:id', (request, response) => {
+  try {
+    response.json(deletePerson(request.params.id));
+  } catch (error) {
+    response.status(404).json({ error: (error as Error).message });
+  }
 });
 
 app.post('/api/chat', async (request, response) => {

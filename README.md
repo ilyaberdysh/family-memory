@@ -19,4 +19,5 @@ npm run dev            # http://localhost:4310
 
 - `server/` — Express, `/api/chat` стримит ответ агента через AI SDK 7, в dev отдаёт Vite.
 - `src/` — React: три вкладки «Агент», «Древо», «Альбом».
+- Древо хранится локально в `data/tree.json` (вне Git) вместе с историей для отмены.
 - `docs/plan.md` — план и этапы, `docs/sources-research.md` — где искать предков.
