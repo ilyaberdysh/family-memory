@@ -1,4 +1,4 @@
-import { Check, CircleAlert, GitBranch, PencilLine, Trash2, UserPlus } from 'lucide-react';
+import { Check, CircleAlert, GitBranch, PencilLine, Trash2, Unlink, UserPlus } from 'lucide-react';
 import { PROVENANCE_LABEL, type Provenance } from '../../shared/types';
 
 export type ToolPart = {
@@ -39,6 +39,9 @@ export function ToolChip({ part, onOpen }: { part: ToolPart; onOpen: () => void 
   } else if (name === 'link_people') {
     icon = <GitBranch aria-hidden />;
     text = output.type === 'spouse' ? `${output.from} и ${output.to} — супруги` : `${output.from} — родитель: ${output.to}`;
+  } else if (name === 'unlink_people') {
+    icon = <Unlink aria-hidden />;
+    text = `Убрана связь: ${output.from} — ${output.to}`;
   } else if (name === 'remove_person') {
     icon = <Trash2 aria-hidden />;
     text = `Убран: ${output.removed}`;

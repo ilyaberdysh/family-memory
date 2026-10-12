@@ -42,12 +42,30 @@ function link(tree: Tree, input: Omit<Relation, 'id'>): Relation {
   if (input.type === 'parent') {
     const parents = tree.relations.filter(r => r.type === 'parent' && r.toId === input.toId);
     if (parents.length >= 2) throw new Error('У этого человека уже два родителя в древе.');
-    const reverse = tree.relations.some(r => r.type === 'parent' && r.fromId === input.toId && r.toId === input.fromId);
-    if (reverse) throw new Error('Обратная связь уже есть: ребёнок не может быть родителем своего родителя.');
+    if (isAncestor(tree, input.toId, input.fromId)) throw new Error('Так получится цикл: ребёнок уже числится предком этого родителя.');
+    const childParents = parents.map(r => r.fromId);
+    if (childParents.some(parentId => isAncestor(tree, input.fromId, parentId))) {
+      throw new Error('Этот человек уже предок одного из родителей ребёнка (например, бабушка). Скорее всего, связь не та: проверь, кем он приходится, и при необходимости убери старую связь через unlink_people.');
+    }
+    const childAncestorsOf = (id: string) => tree.relations.filter(r => r.type === 'parent' && r.fromId === id).map(r => r.toId);
+    if (childAncestorsOf(input.fromId).some(otherChild => isAncestor(tree, otherChild, input.toId))) {
+      throw new Error('Этот человек уже родитель одного из предков ребёнка. Проверь поколение: возможно, он бабушка или дедушка, а не родитель.');
+    }
   }
   const relation = newRelation(input);
   tree.relations.push(relation);
   return relation;
+}
+
+/** True if ancestorId is a parent, grandparent, … of personId. */
+function isAncestor(tree: Tree, ancestorId: string, personId: string, seen = new Set<string>()): boolean {
+  for (const r of tree.relations) {
+    if (r.type !== 'parent' || r.toId !== personId || seen.has(r.fromId)) continue;
+    if (r.fromId === ancestorId) return true;
+    seen.add(r.fromId);
+    if (isAncestor(tree, ancestorId, r.fromId, seen)) return true;
+  }
+  return false;
 }
 
 export const treeTools = {
@@ -121,6 +139,23 @@ export const treeTools = {
     }),
   }),
 
+  unlink_people: tool({
+    description: 'Убрать ошибочную связь между двумя людьми (например, если человека отнесли не к тому родителю). Люди остаются в древе.',
+    inputSchema: z.object({
+      relationId: z.string().optional().describe('id связи из текущего древа'),
+      fromId: z.string().optional(),
+      toId: z.string().optional(),
+    }),
+    execute: async input => change('Убрана связь', tree => {
+      const relation = tree.relations.find(r => input.relationId
+        ? r.id === input.relationId
+        : (r.fromId === input.fromId && r.toId === input.toId) || (r.type === 'spouse' && r.fromId === input.toId && r.toId === input.fromId));
+      if (!relation) throw new Error('Такой связи нет. Смотри id связей в текущем древе.');
+      tree.relations = tree.relations.filter(r => r.id !== relation.id);
+      return { from: find(tree, relation.fromId).name, to: find(tree, relation.toId).name, type: relation.type };
+    }),
+  }),
+
   remove_person: tool({
     description: 'Убрать человека из древа — только если пользователь прямо сказал, что это ошибка или дубль.',
     inputSchema: z.object({ id: z.string() }),
@@ -149,7 +184,7 @@ export function treeContext(): string {
     return `- [${p.id}] ${p.name}${life}${place} (${p.provenance})${p.note ? ` — ${p.note}` : ''}`;
   });
   const links = relations.map(r => r.type === 'parent'
-    ? `- ${name(r.fromId)} → родитель → ${name(r.toId)} (${r.provenance})`
-    : `- ${name(r.fromId)} ⟷ супруги ⟷ ${name(r.toId)} (${r.provenance})`);
+    ? `- [${r.id}] ${name(r.fromId)} — родитель — ${name(r.toId)} (${r.provenance})`
+    : `- [${r.id}] ${name(r.fromId)} и ${name(r.toId)} — супруги (${r.provenance})`);
   return `Люди:\n${lines.join('\n')}\n\nСвязи:\n${links.join('\n') || '- пока нет'}`;
 }
