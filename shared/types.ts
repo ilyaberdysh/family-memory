@@ -42,3 +42,25 @@ export const PROVENANCE_LABEL: Record<Provenance, string> = {
   document: 'документ',
   hypothesis: 'гипотеза',
 };
+
+/** One candidate record found in an external source. Never a confirmed fact by itself. */
+export type Finding = {
+  source: string;
+  name: string;
+  birth?: string;
+  event?: string;
+  place?: string;
+  kind?: string;
+  url: string;
+};
+
+export type SearchResult = {
+  source: string;
+  query: string;
+  searchUrl: string;
+  total: number;
+  shown: Finding[];
+  note?: string;
+};
+
+export type SearchLink = { source: string; label: string; url: string; note?: string };

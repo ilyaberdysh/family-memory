@@ -9,6 +9,7 @@
 ```bash
 cp .env.example .env   # указать ключ OpenAI или Anthropic
 npm install
+npx playwright install chromium   # браузер для поиска по источникам
 npm run dev            # http://localhost:4310
 ```
 
@@ -19,5 +20,6 @@ npm run dev            # http://localhost:4310
 
 - `server/` — Express, `/api/chat` стримит ответ агента через AI SDK 7, в dev отдаёт Vite.
 - `src/` — React: три вкладки «Агент», «Древо», «Альбом».
+- `server/sources/` — адаптеры источников: общий Chromium с очередью и паузой 2,5 с между запросами.
 - Древо хранится локально в `data/tree.json` (вне Git) вместе с историей для отмены.
 - `docs/plan.md` — план и этапы, `docs/sources-research.md` — где искать предков.

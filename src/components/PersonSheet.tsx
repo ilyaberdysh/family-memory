@@ -43,7 +43,13 @@ export function PersonSheet({ person, tree, onSelect, onClose, onDelete }: Props
         </dl>
       )}
       {person.note && <p className="sheet-note">{person.note}</p>}
-      {person.source && <p className="sheet-source">Источник: {person.source}</p>}
+      {person.source && (
+        <p className="sheet-source">
+          Источник: {/^https?:\/\//.test(person.source)
+            ? <a href={person.source} target="_blank" rel="noreferrer">{sourceLabel(person.source)} ↗</a>
+            : person.source}
+        </p>
+      )}
       {group('Родители', parents)}
       {group('Супруги', spouses)}
       {group('Дети', children)}
@@ -52,4 +58,13 @@ export function PersonSheet({ person, tree, onSelect, onClose, onDelete }: Props
       </button>
     </aside>
   );
+}
+
+function sourceLabel(url: string): string {
+  try {
+    const host = new URL(url).hostname.replace(/^www\./, '');
+    return host === 'obd-memorial.ru' ? 'запись в ОБД «Мемориал»' : host;
+  } catch {
+    return url;
+  }
 }

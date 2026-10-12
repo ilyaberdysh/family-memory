@@ -6,6 +6,7 @@ import type { TreeState } from '../../shared/types';
 import { Composer, type ComposerHandle } from './Composer';
 import { Markdown } from './Markdown';
 import { isToolPart, ToolChip, type ToolPart } from './ToolChip';
+import { isResearchPart, ResearchCard } from './FindingsCard';
 import { plural } from '../plural';
 
 const STORAGE_KEY = 'roots.conversation';
@@ -17,13 +18,16 @@ const SUGGESTIONS = [
   'Дедушка воевал, звали его ',
 ];
 
-export const SOURCES = [
-  { name: 'Яндекс Поиск по архивам', note: 'метрические книги, ревизские сказки' },
-  { name: 'Familio', note: 'сканы по фамилии и месту' },
-  { name: 'FamilySearch', note: 'деревья и записи' },
-  { name: 'Память народа', note: 'участники войны, награды' },
-  { name: 'ОБД «Мемориал»', note: 'потери 1941–1945' },
-  { name: 'ГИС УИАД', note: 'каталоги государственных архивов' },
+type SourceStatus = 'live' | 'link' | 'paused' | 'soon';
+const STATUS_LABEL: Record<SourceStatus, string> = { live: 'ищет сам', link: 'по ссылке', paused: 'на паузе', soon: 'скоро' };
+
+export const SOURCES: { name: string; note: string; status: SourceStatus }[] = [
+  { name: 'ОБД «Мемориал»', note: 'погибшие и пропавшие 1941–1945', status: 'live' },
+  { name: 'Память народа', note: 'участники войны, награды', status: 'link' },
+  { name: 'FamilySearch', note: 'деревья и записи', status: 'link' },
+  { name: 'Яндекс Поиск по архивам', note: 'метрические книги — сервис временно недоступен', status: 'paused' },
+  { name: 'Familio', note: 'сканы по фамилии и месту', status: 'soon' },
+  { name: 'ГИС УИАД', note: 'каталоги государственных архивов', status: 'soon' },
 ];
 
 function loadMessages(): UIMessage[] {
@@ -98,7 +102,7 @@ export function AgentView({ tree, onTreeChanged, onOpenTree, onActiveChange }: P
         </div>
         <div className="sources-line" aria-label="Источники">
           <span>Будем искать в</span>
-          {SOURCES.slice(0, 5).map(source => <b key={source.name}>{source.name}</b>)}
+          {SOURCES.filter(source => source.status !== 'paused').slice(0, 5).map(source => <b key={source.name}>{source.name}</b>)}
         </div>
       </section>
     );
@@ -113,9 +117,11 @@ export function AgentView({ tree, onTreeChanged, onOpenTree, onActiveChange }: P
         <div className="thread" aria-live="polite">
           {messages.map(message => {
             if (message.role === 'user') return <div key={message.id} className="message user">{textOf(message)}</div>;
-            const chips = message.parts.filter(isToolPart) as unknown as ToolPart[];
+            const tools = message.parts.filter(isToolPart) as unknown as ToolPart[];
+            const chips = tools.filter(part => !isResearchPart(part));
+            const research = tools.filter(isResearchPart);
             const text = textOf(message);
-            if (!text && chips.length === 0) return null;
+            if (!text && tools.length === 0) return null;
             return (
               <div key={message.id} className="message assistant">
                 {chips.length > 0 && (
@@ -123,6 +129,7 @@ export function AgentView({ tree, onTreeChanged, onOpenTree, onActiveChange }: P
                     {chips.map(part => <ToolChip key={part.toolCallId} part={part} onOpen={onOpenTree} />)}
                   </div>
                 )}
+                {research.map(part => <ResearchCard key={part.toolCallId} part={part} />)}
                 {text && <Markdown text={text} />}
               </div>
             );
@@ -138,7 +145,7 @@ export function AgentView({ tree, onTreeChanged, onOpenTree, onActiveChange }: P
         </div>
         <div className="dock">
           <Composer ref={composer} onSend={send} busy={busy} onStop={stop} placeholder="Ответьте или расскажите ещё…" autoFocus />
-          <p className="dock-note">Агент ведёт древо по вашему рассказу. Поиск по архивам подключим следующим шагом.</p>
+          <p className="dock-note">Агент ведёт древо и ищет в ОБД «Мемориал». Найденное — кандидаты, родство подтверждаете вы.</p>
         </div>
       </div>
 
@@ -152,12 +159,12 @@ export function AgentView({ tree, onTreeChanged, onOpenTree, onActiveChange }: P
         </button>
 
         <h2 className="panel-title">Находки</h2>
-        <p className="panel-sub">Здесь появятся записи из архивов: скан, распознанный текст и ссылка на оригинал.</p>
+        <p className="panel-sub">Агент сам ищет в подключённых источниках. Каждая запись — со ссылкой на оригинал; родство подтверждаете вы.</p>
         <ul className="source-list">
           {SOURCES.map(source => (
             <li key={source.name}>
               <span className="source-name">{source.name}<small>{source.note}</small></span>
-              <span className="pill">скоро</span>
+              <span className="pill" data-status={source.status}>{STATUS_LABEL[source.status]}</span>
             </li>
           ))}
         </ul>
