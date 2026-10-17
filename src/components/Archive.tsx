@@ -68,10 +68,10 @@ export default function Archive({ state, onRefresh, initialPersonId, onPersonOpe
     if (createDirty && createWarning.current && !window.confirm(createWarning.current)) return;
     setCreating(null); setCreateDirty(false);
   };
-  return <section className="archive-page" aria-label="Семейный архив">
+  return <section className="archive-page" aria-label="Семейный альбом">
     <header className="archive-heading">
-      <div><p className="archive-eyebrow">Наша семья</p><h1>Семейный архив</h1><p className="archive-intro">Истории, фотографии, аудио и видео</p></div>
-      {canAdd && <button className="button primary" onClick={() => { setCreateDirty(false); setCreating('story'); }}><Plus size={18} /> Добавить материал</button>}
+      <div><p className="archive-eyebrow">Сохранить</p><h1>Семейный альбом</h1><p className="archive-intro">Фотографии, голоса и истории, которые хочется листать вместе</p></div>
+      {canAdd && <button className="button primary" onClick={() => { setCreateDirty(false); setCreating('story'); }}><Plus size={18} /> Добавить воспоминание</button>}
     </header>
     {notice && <div className="archive-notice" role="status"><Check size={17} />{notice}<button className="icon-button" onClick={() => setNotice('')} aria-label="Закрыть сообщение"><X size={16} /></button></div>}
     <div className="archive-toolbar">
@@ -89,12 +89,12 @@ export default function Archive({ state, onRefresh, initialPersonId, onPersonOpe
       <div className="archive-grid">{filtered.map(entry => <MaterialCard key={entry.material.id} entry={entry} state={state} onOpen={() => setSelectedId(entry.material.id)} />)}</div>
     </> : <div className="archive-empty">
       <div className="archive-empty-symbol"><BookOpen size={32} strokeWidth={1.5} /></div>
-      <h2>{hasFilters ? 'Пока ничего не нашлось' : 'В архиве пока нет материалов'}</h2>
-      <p>{hasFilters ? 'Попробуйте другое имя, тип материала или уберите фильтры.' : canAdd ? 'Добавьте историю, фотографию или запись. Связать их с людьми можно позже.' : 'Здесь появятся материалы, которыми поделится семья.'}</p>
-      {hasFilters ? <button className="button secondary" onClick={() => { setQuery(''); setKind('all'); setPersonId(''); }}>Сбросить фильтры</button> : canAdd && <button className="button primary" onClick={() => setCreating('story')}><Plus size={18} /> Добавить первый материал</button>}
+      <h2>{hasFilters ? 'Пока ничего не нашлось' : 'Начните семейный альбом'}</h2>
+      <p>{hasFilters ? 'Попробуйте другое имя, тип материала или уберите фильтры.' : canAdd ? 'Добавьте первую фотографию, историю или голосовую запись. К людям из древа их можно привязать позже.' : 'Здесь появятся воспоминания, которыми поделится семья.'}</p>
+      {hasFilters ? <button className="button secondary" onClick={() => { setQuery(''); setKind('all'); setPersonId(''); }}>Сбросить фильтры</button> : canAdd && <button className="button primary" onClick={() => setCreating('story')}><Plus size={18} /> Добавить первое воспоминание</button>}
       {!hasFilters && canAdd && <button className="archive-text-button" onClick={() => setCreating('audio')}><Mic size={16} /> Или записать разговор</button>}
     </div>}
-    <Modal open={creating !== null} onClose={closeCreate} title="Добавить материал" wide>
+    <Modal open={creating !== null} onClose={closeCreate} title="Добавить в семейный альбом" wide>
       {creating && <MaterialForm state={state} initialKind={creating} initialPersonId={personId} closeWarning={createWarning} onDirtyChange={setCreateDirty} onBusyChange={setCreateBusy} onCancel={closeCreate} onSaved={async material => { setCreating(null); setCreateDirty(false); setNotice('Материал сохранён в семейном архиве.'); setSelectedId(material.id); await onRefresh(); }} />}
     </Modal>
     {selectedId && <MaterialDetail id={selectedId} state={state} onRefresh={onRefresh} onClose={() => setSelectedId(null)} onPersonOpen={onPersonOpen} />}

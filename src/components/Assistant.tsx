@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AssistantRuntimeProvider, ComposerPrimitive, MessagePrimitive, ThreadPrimitive, useExternalStoreRuntime, type AppendMessage, type ThreadMessageLike } from '@assistant-ui/react';
-import { Archive, ArrowDown, ArrowUp, Check, Download, FileAudio, FileText, Info, List, ListChecks, LoaderCircle, MessageSquare, Mic, Pencil, Plus, RotateCcw, Upload, X } from 'lucide-react';
+import { Archive, ArrowDown, ArrowUp, Check, Download, FileAudio, FileText, Globe2, Image, Info, List, ListChecks, LoaderCircle, MessageSquare, Mic, Pencil, Plus, RotateCcw, Search, Send, Sparkles, Upload, X } from 'lucide-react';
 import type { AppState, Conversation, ConversationMessage, ConversationSummary, UploadedFile } from '../../shared/types';
 import { ApiError, api, json, upload } from '../api';
 import { DraftNote, formatDate } from './ui';
@@ -39,6 +39,8 @@ export default function Assistant({ state, onRefresh, onPersonOpen, onActivityCh
   const [listOpen, setListOpen] = useState(false);
   const [blocked, setBlocked] = useState(false);
   const [reviewId, setReviewId] = useState<string | null>(null);
+  const [welcomeDraft, setWelcomeDraft] = useState('');
+  const [starterPrompt, setStarterPrompt] = useState('');
   const selection = useRef(0);
   const sectionRef = useRef<HTMLElement | null>(null);
   const activityCallback = useRef(onActivityChange);
@@ -102,7 +104,7 @@ export default function Assistant({ state, onRefresh, onPersonOpen, onActivityCh
     } catch (cause) { setError(errorText(cause)); }
     finally { if (selection.current === request) setOpening(false); }
   }
-  async function create() {
+  async function create(prompt = '') {
     if (opening || !canWrite || !canSwitch()) return;
     const request = ++selection.current;
     setOpening(true); setError('');
@@ -110,6 +112,7 @@ export default function Assistant({ state, onRefresh, onPersonOpen, onActivityCh
       const next = await api<Conversation>('/api/conversations', json('POST', {}));
       if (selection.current !== request) return;
       setConversation(next); setConversations(current => [asSummary(next), ...current]);
+      setStarterPrompt(prompt.trim()); setWelcomeDraft('');
       activity(false); setListOpen(false);
     } catch (cause) { setError(errorText(cause)); }
     finally { if (selection.current === request) setOpening(false); }
@@ -121,8 +124,8 @@ export default function Assistant({ state, onRefresh, onPersonOpen, onActivityCh
     finally { setLoading(false); }
   }
 
-  return <section ref={sectionRef} className="family-assistant" aria-label="Ассистент">
-    <header className="assistant-page-header"><div><p className="assistant-breadcrumb">Наша семья</p><h1>Ассистент</h1><p>Рассказывайте о семье текстом или голосом</p></div><div className="assistant-header-actions"><button className="assistant-list-toggle" aria-label="Разговоры" aria-expanded={listOpen} onClick={() => setListOpen(value => !value)}><List size={19} /></button>{canWrite && <button className="button primary" aria-label="Новый разговор" disabled={opening || loading} onClick={() => void create()}><Plus size={18} /><span>Новый разговор</span></button>}</div></header>
+  return <section ref={sectionRef} className="family-assistant" aria-label="Исследование семьи">
+    <header className="assistant-page-header"><div><p className="assistant-breadcrumb">Главная · исследование</p><h1>Исследование семьи</h1><p>Разговор, документы и семейные версии — в одном месте</p></div><div className="assistant-header-actions"><button className="assistant-list-toggle" aria-label="Разговоры" aria-expanded={listOpen} onClick={() => setListOpen(value => !value)}><List size={19} /></button>{canWrite && <button className="button primary" aria-label="Новое исследование" disabled={opening || loading} onClick={() => void create()}><Plus size={18} /><span>Новое исследование</span></button>}</div></header>
     {error && <div className="assistant-page-error" role="alert">{error}<button className="button secondary" disabled={loading} onClick={() => void reloadList()}>Обновить список</button></div>}
     <div className={`assistant-layout ${listOpen ? 'is-list-open' : ''}`}>
       <aside className="assistant-conversations" aria-label="Сохранённые разговоры">
@@ -131,7 +134,11 @@ export default function Assistant({ state, onRefresh, onPersonOpen, onActivityCh
       </aside>
       <div className="assistant-chat-panel">
         {opening && <p className="assistant-opening" role="status"><LoaderCircle size={16} className="assistant-spinner" />Открываем разговор…</p>}
-        {conversation ? <ConversationView key={conversation.id} conversation={conversation} state={state} onChange={receive} onRefresh={onRefresh} onActivityChange={activity} onReview={setReviewId} /> : <div className="assistant-welcome"><MessageSquare size={34} strokeWidth={1.5} /><h2>{loading ? 'Загружаем…' : 'Начните с того, что помните'}</h2><p>{canWrite ? 'Можно записать короткое воспоминание, рассказать о человеке или задать вопрос по своему рассказу.' : 'Здесь можно читать сохранённые разговоры.'}</p>{!loading && canWrite && <button className="button primary" disabled={opening} onClick={() => void create()}><Plus size={17} />Начать разговор</button>}<p className="assistant-welcome-note">Историю можно сохранить в архиве. Сведения попадут в дерево только после вашей проверки.</p><p className="assistant-privacy">Разговор виден вам и администратору. После сохранения в архив — всей семье.</p></div>}
+        {conversation ? <ConversationView key={conversation.id} conversation={conversation} state={state} initialPrompt={starterPrompt} onStarterConsumed={() => setStarterPrompt('')} onChange={receive} onRefresh={onRefresh} onActivityChange={activity} onReview={setReviewId} /> : <div className="assistant-welcome">
+          <div className="assistant-welcome-copy"><span className="assistant-welcome-kicker"><Sparkles size={15} /> Семейный исследователь</span><h2>{loading ? 'Открываем семейную историю…' : 'С чего начнём историю вашей семьи?'}</h2><p>{canWrite ? 'Назовите человека, фамилию, место или загадку. Ассистент поможет разобрать то, что уже известно, отметить версии и подготовить факты к проверке.' : 'Здесь можно читать сохранённые исследования.'}</p></div>
+          {!loading && canWrite && <><form className="assistant-welcome-composer" onSubmit={event => { event.preventDefault(); if (welcomeDraft.trim()) void create(welcomeDraft); }}><textarea rows={2} autoFocus value={welcomeDraft} onChange={event => setWelcomeDraft(event.target.value)} placeholder="Например: что мы знаем о прадеде, который жил в Твери?" aria-label="Первый вопрос об истории семьи" /><div><span>Можно начать с обрывка воспоминания</span><button type="submit" className="assistant-welcome-send" disabled={opening || !welcomeDraft.trim()} aria-label="Начать исследование"><Send size={19} /></button></div></form><div className="assistant-starters" aria-label="Идеи для начала"><button disabled={opening} onClick={() => void create('Хочу разобраться в истории нашей фамилии. С чего лучше начать?')}><Search size={18} /><span><strong>Исследовать фамилию</strong><small>Собрать известные места, даты и версии</small></span></button><button disabled={opening} onClick={() => void create('Помоги разобрать старую семейную фотографию и понять, что о ней спросить у родственников.')}><Image size={18} /><span><strong>Разобрать фотографию</strong><small>Люди, место, примерная дата, вопросы</small></span></button><button disabled={opening} onClick={() => void create('Помоги подготовить разговор с родственником о нашей семейной истории.')}><Mic size={18} /><span><strong>Записать воспоминание</strong><small>Интервью, расшифровка и сохранение</small></span></button></div></>}
+          <div className="assistant-research-status"><Globe2 size={17} /><p><strong>Сейчас:</strong> разговоры, голосовые записи и разбор семейных фактов. <span>Поиск по открытым архивам — следующий этап и всегда со ссылками на источники.</span></p></div><p className="assistant-privacy">Черновик разговора виден вам и администратору. В семейный альбом и древо ничего не попадёт без вашего решения.</p>
+        </div>}
       </div>
     </div>
     {reviewId && <MaterialDetail id={reviewId} initialView="proposals" state={state} onRefresh={onRefresh} onClose={() => setReviewId(null)} onPersonOpen={onPersonOpen} />}
@@ -140,13 +147,15 @@ export default function Assistant({ state, onRefresh, onPersonOpen, onActivityCh
 
 interface ConversationViewProps {
   conversation: Conversation; state: AppState;
+  initialPrompt?: string;
+  onStarterConsumed?: () => void;
   onChange: (conversation: Conversation) => void;
   onRefresh: () => Promise<void>;
   onActivityChange: (blocked: boolean) => void;
   onReview: (materialId: string) => void;
 }
 
-function ConversationView({ conversation, state, onChange, onRefresh, onActivityChange, onReview }: ConversationViewProps) {
+function ConversationView({ conversation, state, initialPrompt, onStarterConsumed, onChange, onRefresh, onActivityChange, onReview }: ConversationViewProps) {
   const [draft, setDraft] = useState('');
   const [voice, setVoice] = useState<File | null>(null);
   const [recorderOpen, setRecorderOpen] = useState(false);
@@ -293,6 +302,13 @@ function ConversationView({ conversation, state, onChange, onRefresh, onActivity
     const sync = () => setDraft(runtime.thread.composer.getState().text);
     sync(); return runtime.thread.composer.subscribe(sync);
   }, [runtime]);
+  const starterApplied = useRef(false);
+  useEffect(() => {
+    if (starterApplied.current || !initialPrompt || !canWrite || conversation.messages.length) return;
+    starterApplied.current = true;
+    runtime.thread.composer.setText(initialPrompt);
+    onStarterConsumed?.();
+  }, [runtime, initialPrompt, canWrite, conversation.messages.length, onStarterConsumed]);
   const restoredOnce = useRef(false);
   useEffect(() => {
     if (restoredOnce.current || !canWrite) return;
@@ -368,7 +384,7 @@ function ConversationView({ conversation, state, onChange, onRefresh, onActivity
     <ThreadPrimitive.Root className={`assistant-thread ${empty ? 'is-empty' : ''} ${processing ? 'is-processing' : ''}`}>
       <div className="assistant-thread-heading"><h2 title={conversation.title}>{conversation.title || 'Новый разговор'}</h2><span>{formatDate(conversation.createdAt)}</span></div>
       <ThreadPrimitive.Viewport className="assistant-viewport" autoScroll={!empty} aria-label="Сообщения разговора">
-        {empty ? <div className="assistant-thread-empty"><p className="assistant-empty-label">Новый разговор</p><h3>Расскажите о человеке<br className="assistant-empty-break" /> или событии</h3><p>Напишите, что помните, или запишите голосом.{state.settings.aiAvailable ? ' Ассистент поможет уточнить детали.' : ' Рассказ можно сохранить в архив без обработки.'}</p></div> : <ConversationPrivacy aiAvailable={state.settings.aiAvailable} />}
+        {empty ? <div className="assistant-thread-empty"><p className="assistant-empty-label">Новое исследование</p><h3>Начните с человека,<br className="assistant-empty-break" /> места или семейной загадки</h3><p>Напишите то, что уже известно, или запишите голосом.{state.settings.aiAvailable ? ' Ассистент задаст уточняющие вопросы и отделит факты от версий.' : ' Рассказ можно сохранить в семейный альбом без обработки.'}</p></div> : <ConversationPrivacy aiAvailable={state.settings.aiAvailable} />}
         {!state.settings.aiAvailable && <div className="assistant-connection-note"><FileText size={18} /><p><strong>Ассистент ещё не подключён.</strong> Текст и записи сохраняются. Расшифровка и ответы пока недоступны.</p></div>}
         <ThreadPrimitive.Messages>{({ message }) => {
           const original = message.metadata.custom.original as ConversationMessage | undefined;

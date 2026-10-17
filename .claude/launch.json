@@ -1,0 +1,48 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "family-memory-preview",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "DEV_AUTH=1",
+        "HOST=127.0.0.1",
+        "PORT=4318",
+        "PUBLIC_ORIGIN=http://localhost:4318",
+        "DATA_DIR=/private/tmp/claude-501/-Users-ilya-Documents-family-memory/899a78f7-b0de-4e83-a7ad-03a556a68a96/scratchpad/fm-data",
+        "TELEGRAM_CLIENT_ID=",
+        "TELEGRAM_CLIENT_SECRET=",
+        "OPENAI_API_KEY=",
+        "npx",
+        "tsx",
+        "server/index.ts"
+      ],
+      "port": 4318
+    },
+    {
+      "name": "family-roots",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "--prefix",
+        "/Users/ilya/Documents/family-roots",
+        "run",
+        "dev"
+      ],
+      "port": 4310
+    },
+    {
+      "name": "family-roots-test",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "PORT=4311",
+        "DATA_DIR=/private/tmp/claude-501/-Users-ilya-Documents-family-memory/e27e0f4a-aa1d-4479-8772-c17b09845f81/scratchpad/roots-e2e",
+        "npm",
+        "--prefix",
+        "/Users/ilya/Documents/family-roots",
+        "run",
+        "dev"
+      ],
+      "port": 4311
+    }
+  ]
+}

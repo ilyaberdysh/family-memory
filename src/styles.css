@@ -76,3 +76,69 @@ h1{font-size:32px;line-height:1.15}.page-header h1{font-size:34px}.breadcrumb{fo
 .error-fallback h2{font-size:24px}.error-fallback p{color:#5f564d;font-size:15px;line-height:1.75}
 .error-fallback-actions{display:flex;flex-wrap:wrap;justify-content:center;gap:10px;margin-top:6px}.error-fallback .button{min-height:46px;font-size:15px}
 @media(max-width:759px){.app-notices{padding:10px 20px 0}.app-notice{padding:10px 8px 10px 12px}.app-notice>svg{display:none}.app-notice-actions{width:100%;margin-left:0}.app-notice-actions .button{flex:1}.recording-item-actions .button{flex:1 1 140px}.app-notice.is-compact-mobile .app-notice-text p{display:none}.app-notice.is-compact-mobile{padding-top:8px;padding-bottom:8px}.error-fallback{margin:24px auto;padding:20px}}
+
+/* Chat-first redesign: research and family memory are the two primary product modes. */
+:root{
+  --blue:#1d5b4d;
+  --accent:#1d5b4d;
+  --text:#1d2a25;
+  --muted:#766f65;
+  --line:#e4ddd0;
+  --panel:#fffdf8;
+  --surface:#fffdf8;
+  --bg:#f2eee5;
+  --paper:#f7f3eb;
+  --coral:#d87352;
+  --sidebar:252px;
+  --serif:"Iowan Old Style","Palatino Linotype","Book Antiqua",Georgia,serif;
+  font-family:"Avenir Next",Avenir,"Segoe UI",sans-serif;
+  color:#1d2a25;
+  background:#f2eee5;
+}
+.app-shell-v2 .sidebar{background:#183c34;border:0;padding:30px 18px 20px;color:#f8f2e7}
+.app-shell-v2 .sidebar .brand{color:#fffaf0;padding:0 10px;font-family:var(--serif);font-size:21px;font-weight:600;letter-spacing:-.02em}
+.app-shell-v2 .sidebar .brand-mark{background:#d97858;color:#fff8ef;border-radius:50%;box-shadow:none}
+.app-shell-v2 .workspace-switcher{color:#d8e5dd}
+.app-shell-v2 .desktop-nav{margin-top:34px;gap:5px}
+.nav-kicker{margin:0 12px 8px;color:#84aa9e;font-size:10px;font-weight:700;letter-spacing:.14em;text-transform:uppercase}
+.nav-kicker-secondary{margin-top:24px}
+.app-shell-v2 .nav-item{color:#bcd0c8;border-radius:12px;padding:11px 12px;min-height:46px;font-size:14px}
+.app-shell-v2 .nav-item:hover{background:#214a40;color:#fff8ef}
+.app-shell-v2 .nav-item.active{background:#f3eee4;color:#173c34;box-shadow:none;font-weight:650}
+.app-shell-v2 .nav-item.active svg{color:#d36f4e}
+.app-shell-v2 .help-link{color:#8eb0a5}
+.app-shell-v2 .sidebar-user{border-color:#2d554a}
+.app-shell-v2 .sidebar-user strong{color:#fff8ef}.app-shell-v2 .sidebar-user small{color:#8fb0a5}
+.app-shell-v2 .sidebar-user>.icon-button{color:#89aa9f}
+.app-shell-v2 .main-workspace{background:var(--paper)}
+.app-shell-v2 .page-header h1,.app-shell-v2 .archive-heading h1,.app-shell-v2 .modal-heading h2{font-family:var(--serif);font-weight:600}
+.app-shell-v2 .button.primary{background:#1d5b4d;color:#fffaf2;box-shadow:none}
+.app-shell-v2 .button.primary:hover{background:#174b40}
+.app-shell-v2 .button.secondary{background:#ebe5da;border-color:#ddd4c6;color:#29423b}
+.app-shell-v2 input:focus,.app-shell-v2 select:focus,.app-shell-v2 textarea:focus{border-color:#6f998e;box-shadow:0 0 0 3px #1d5b4d16}
+.app-shell-v2 button:focus-visible,.app-shell-v2 a:focus-visible{outline-color:#e58a69}
+.app-shell-v2 .app-notice{background:#f7eee2;border-color:#e8d4bd;color:#483b31}
+.app-shell-v2 .view-assistant .app-notices{padding-top:8px}
+.app-shell-v2 .view-assistant .app-notice{flex-wrap:nowrap;padding:7px 9px 7px 13px}
+.app-shell-v2 .view-assistant .app-notice-text strong{font-size:12px}
+.app-shell-v2 .view-assistant .app-notice-text p{display:none}
+.app-shell-v2 .view-assistant .app-notice-actions{flex-wrap:nowrap}
+.app-shell-v2 .view-assistant .app-notice-actions .button{min-height:36px;padding-block:6px;font-size:12px}
+
+@media(max-width:940px) and (min-width:760px){
+  :root{--sidebar:82px}
+  .app-shell-v2 .sidebar .nav-kicker{display:none}
+  .app-shell-v2 .desktop-nav{margin-top:30px}
+}
+@media(max-width:759px){
+  :root{--sidebar:0px}
+  .app-shell-v2 .mobile-brand{background:#f7f3eb;border-bottom-color:#e7ded0}
+  .app-shell-v2 .mobile-brand .brand-mark{background:#d97858;border-radius:50%}
+  .app-shell-v2 .mobile-nav{grid-template-columns:repeat(3,1fr);background:#fbf8f1eF;border-top:1px solid #ded5c8;backdrop-filter:blur(18px)}
+  .app-shell-v2 .mobile-nav button{color:#81796e;font-size:10px}
+  .app-shell-v2 .mobile-nav button.active{color:#1d5b4d}
+  .app-shell-v2 .mobile-nav button.active svg{stroke-width:2.3}
+  .app-shell-v2 .view-assistant .app-notices{padding:7px 20px 0}
+  .app-shell-v2 .view-assistant .app-notice-actions{width:auto}
+  .app-shell-v2 .view-assistant .app-notice-actions .button{width:auto;min-width:0;padding-inline:10px}
+}
