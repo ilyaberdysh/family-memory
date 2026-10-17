@@ -57,6 +57,7 @@ if (production) {
   app.use(vite.middlewares);
 }
 
-server.listen(port, '127.0.0.1', () => {
+// HOST=0.0.0.0 inside the container; loopback by default for the local stand.
+server.listen(port, process.env.HOST ?? '127.0.0.1', () => {
   console.log(`Корни: http://localhost:${port}`);
 });
