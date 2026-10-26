@@ -159,7 +159,7 @@ export function AgentView({ tree, onTreeChanged, onOpenTree, onActiveChange }: P
         </button>
 
         <h2 className="panel-title">Находки</h2>
-        <p className="panel-sub">Агент сам ищет в подключённых источниках. Каждая запись — со ссылкой на оригинал; родство подтверждаете вы.</p>
+        <p className="panel-sub">Агент сам ищет в подключённых источниках. Каждая запись — со ссылкой и происхождением; родство подтверждаете вы.</p>
         <ul className="source-list">
           {SOURCES.map(source => (
             <li key={source.name}>

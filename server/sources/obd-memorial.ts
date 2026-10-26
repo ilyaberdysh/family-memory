@@ -27,6 +27,14 @@ const EXTRACT_ROWS = `[...document.querySelectorAll('.search-result')].map(node 
 
 type Row = { id: string; name: string; birth: string; out: string; place: string; kind: string };
 
+export function interpretObdSearchPage(totalText: string | null, bodyText: string, rows: Row[]): { total: number; rows: Row[] } {
+  const parsedTotal = totalText?.match(/из\s+(\d+)/i)?.[1];
+  if (parsedTotal !== undefined) return { total: Number(parsedTotal), rows };
+  if (rows.length > 0) throw new Error('ОБД вернула строки без счётчика результатов; поиск зафиксирован как неполный.');
+  if (/ничего не найдено|запис(?:ей|и) не найдено|поиск не дал результатов/i.test(bodyText)) return { total: 0, rows };
+  throw new Error('Не удалось подтвердить загрузку результатов ОБД; отрицательный результат не фиксируется.');
+}
+
 /** Reads the rendered results table, the same thing a person sees. */
 async function readPage(url: string): Promise<{ total: number; rows: Row[] }> {
   return withPage(url, async page => {
@@ -34,7 +42,8 @@ async function readPage(url: string): Promise<{ total: number; rows: Row[] }> {
     const totalText = await page.locator('text=/Записи с \\d+ по \\d+ из \\d+/').first().textContent({ timeout: 2_000 }).catch(() => null);
     // Plain string so the bundler cannot inject helpers that do not exist in the page.
     const rows = (await page.evaluate(EXTRACT_ROWS)) as Row[];
-    return { total: Number(totalText?.match(/из (\d+)/)?.[1] ?? rows.length), rows };
+    const bodyText = (await page.evaluate('document.body.innerText')) as string;
+    return interpretObdSearchPage(totalText, bodyText, rows);
   });
 }
 
@@ -73,7 +82,7 @@ export async function searchObd(query: ObdQuery, limit = 15): Promise<SearchResu
   if (query.birthYear) parts.push(`Подходят по году (${query.birthYear}±3) или без года: ${filtered.length}.`);
   if (filtered.length > shown.length) parts.push(`Показаны ${shown.length} ближайших.`);
 
-  return { source: SOURCE, query: describe(query), searchUrl, total: broad.total, shown, note: parts.join(' ') };
+  return { source: SOURCE, query: describe(query), searchUrl, total: broad.total, searched: rows.length, shown, note: parts.join(' ') };
 }
 
 function clean(date: string): string | undefined {

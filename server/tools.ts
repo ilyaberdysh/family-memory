@@ -1,7 +1,24 @@
 import { tool } from 'ai';
 import { z } from 'zod';
-import type { LifeEvent, Person, Relation, Tree } from '../shared/types.js';
+import type { LifeEvent, Person, Provenance, Relation, Tree } from '../shared/types.js';
+import { reconcileResearchWithTree, recordRelationshipRemoval, recordTreePerson, recordTreeRelationship } from './research-store.js';
 import { change, getTree, newPerson, newRelation } from './tree-store.js';
+import { withPersistenceTransaction } from './persistence-transaction.js';
+
+export function evidenceSafeRelationProvenance(personProvenances: Provenance[], requested: Provenance): Provenance {
+  return personProvenances.includes('hypothesis') ? 'hypothesis' : requested;
+}
+
+export function requireDocumentSource(provenanceValue: Provenance, source?: string): void {
+  const reference = source?.trim() ?? '';
+  const isUrl = /^https?:\/\/[^\s]+$/i.test(reference);
+  const isArchiveReference = /(?:^|[,;\s])ф\.?\s*\S+/iu.test(reference)
+    && /(?:^|[,;\s])оп\.?\s*\S+/iu.test(reference)
+    && /(?:^|[,;\s])д\.?\s*\S+/iu.test(reference);
+  if (provenanceValue === 'document' && !isUrl && !isArchiveReference) {
+    throw new Error('Для provenance=document нужна реальная ссылка или архивный шифр источника.');
+  }
+}
 
 const provenance = z.enum(['told', 'document', 'hypothesis'])
   .describe('told — человек сам рассказал; document — есть документ со ссылкой; hypothesis — твой вывод (например, имя отца из отчества).');
@@ -79,25 +96,40 @@ export const treeTools = {
         kind: z.enum(['parent_of', 'child_of', 'spouse_of']).describe('parent_of — новый человек родитель personId; child_of — ребёнок personId'),
         personId: z.string(),
         provenance: provenance.optional(),
+        source: z.string().max(400).optional().describe('Для document — реальная ссылка или архивный шифр источника'),
       })).max(8).optional(),
     }),
-    execute: async input => change(`Добавлен: ${input.name}`, tree => {
-      const person = newPerson({
-        name: input.name.trim(),
-        sex: input.sex,
-        birth: event(input.birthYear, input.birthApproximate, input.birthPlace),
-        death: event(input.deathYear, input.deathApproximate, input.deathPlace),
-        note: input.note?.trim() || undefined,
-        provenance: input.provenance,
-        source: input.source,
+    execute: async input => withPersistenceTransaction(() => {
+      requireDocumentSource(input.provenance, input.source);
+      const createdRelations: Relation[] = [];
+      const person = change(`Добавлен: ${input.name}`, tree => {
+        const created = newPerson({
+          name: input.name.trim(),
+          sex: input.sex,
+          birth: event(input.birthYear, input.birthApproximate, input.birthPlace),
+          death: event(input.deathYear, input.deathApproximate, input.deathPlace),
+          note: input.note?.trim() || undefined,
+          provenance: input.provenance,
+          source: input.source,
+        });
+        tree.people.push(created);
+        for (const item of input.links ?? []) {
+          const existingPerson = find(tree, item.personId);
+          const relationProvenance = evidenceSafeRelationProvenance(
+            [input.provenance, existingPerson.provenance],
+            item.provenance ?? input.provenance,
+          );
+          const relationSource = item.source ?? input.source;
+          requireDocumentSource(relationProvenance, relationSource);
+          if (item.kind === 'parent_of') createdRelations.push(link(tree, { type: 'parent', fromId: created.id, toId: item.personId, provenance: relationProvenance, source: relationSource }));
+          if (item.kind === 'child_of') createdRelations.push(link(tree, { type: 'parent', fromId: item.personId, toId: created.id, provenance: relationProvenance, source: relationSource }));
+          if (item.kind === 'spouse_of') createdRelations.push(link(tree, { type: 'spouse', fromId: created.id, toId: item.personId, provenance: relationProvenance, source: relationSource }));
+        }
+        return created;
       });
-      tree.people.push(person);
-      for (const item of input.links ?? []) {
-        const relationProvenance = item.provenance ?? input.provenance;
-        if (item.kind === 'parent_of') link(tree, { type: 'parent', fromId: person.id, toId: item.personId, provenance: relationProvenance });
-        if (item.kind === 'child_of') link(tree, { type: 'parent', fromId: item.personId, toId: person.id, provenance: relationProvenance });
-        if (item.kind === 'spouse_of') link(tree, { type: 'spouse', fromId: person.id, toId: item.personId, provenance: relationProvenance });
-      }
+      recordTreePerson(person);
+      const people = getTree().people;
+      for (const relation of createdRelations) recordTreeRelationship(relation, people);
       return { id: person.id, name: person.name, provenance: person.provenance };
     }),
   }),
@@ -110,17 +142,30 @@ export const treeTools = {
       provenance: provenance.optional(),
       ...lifeFields,
     }),
-    execute: async input => change('Уточнены сведения', tree => {
-      const person = find(tree, input.id);
-      if (input.name) person.name = input.name.trim();
-      if (input.provenance) person.provenance = input.provenance;
-      if (input.sex) person.sex = input.sex;
-      if (input.note) person.note = input.note.trim();
-      if (input.source) person.source = input.source;
-      const birth = event(input.birthYear, input.birthApproximate, input.birthPlace);
-      if (birth) person.birth = { ...person.birth, ...stripUndefined(birth) };
-      const death = event(input.deathYear, input.deathApproximate, input.deathPlace);
-      if (death) person.death = { ...person.death, ...stripUndefined(death) };
+    execute: async input => withPersistenceTransaction(() => {
+      const person = change('Уточнены сведения', tree => {
+        const updated = find(tree, input.id);
+        if (input.name) updated.name = input.name.trim();
+        if (input.provenance) updated.provenance = input.provenance;
+        if (input.sex) updated.sex = input.sex;
+        if (input.note) updated.note = input.note.trim();
+        if (input.source) updated.source = input.source;
+        const birth = event(input.birthYear, input.birthApproximate, input.birthPlace);
+        if (birth) updated.birth = { ...updated.birth, ...stripUndefined(birth) };
+        const death = event(input.deathYear, input.deathApproximate, input.deathPlace);
+        if (death) updated.death = { ...updated.death, ...stripUndefined(death) };
+        requireDocumentSource(updated.provenance, updated.source);
+        return structuredClone(updated);
+      });
+      const changedFields = [
+        input.name !== undefined && 'name',
+        (input.birthYear !== undefined || input.birthApproximate !== undefined) && 'birth-date',
+        input.birthPlace !== undefined && 'birth-place',
+        (input.deathYear !== undefined || input.deathApproximate !== undefined) && 'death-date',
+        input.deathPlace !== undefined && 'death-place',
+        input.note !== undefined && 'biographical-note',
+      ].filter((item): item is string => Boolean(item));
+      recordTreePerson(person, changedFields);
       return { id: person.id, name: person.name };
     }),
   }),
@@ -132,10 +177,18 @@ export const treeTools = {
       fromId: z.string().describe('Для parent — родитель'),
       toId: z.string().describe('Для parent — ребёнок'),
       provenance,
+      source: z.string().max(400).optional().describe('Для document — реальная ссылка или архивный шифр источника'),
     }),
-    execute: async input => change('Добавлена связь', tree => {
-      const relation = link(tree, input);
-      return { id: relation.id, from: find(tree, relation.fromId).name, to: find(tree, relation.toId).name, type: relation.type };
+    execute: async input => withPersistenceTransaction(() => {
+      const relation = change('Добавлена связь', tree => {
+        const people = [find(tree, input.fromId), find(tree, input.toId)];
+        const relationProvenance = evidenceSafeRelationProvenance(people.map(person => person.provenance), input.provenance);
+        requireDocumentSource(relationProvenance, input.source);
+        return structuredClone(link(tree, { ...input, provenance: relationProvenance }));
+      });
+      const people = getTree().people;
+      recordTreeRelationship(relation, people);
+      return { id: relation.id, from: people.find(person => person.id === relation.fromId)?.name, to: people.find(person => person.id === relation.toId)?.name, type: relation.type };
     }),
   }),
 
@@ -146,24 +199,33 @@ export const treeTools = {
       fromId: z.string().optional(),
       toId: z.string().optional(),
     }),
-    execute: async input => change('Убрана связь', tree => {
-      const relation = tree.relations.find(r => input.relationId
-        ? r.id === input.relationId
-        : (r.fromId === input.fromId && r.toId === input.toId) || (r.type === 'spouse' && r.fromId === input.toId && r.toId === input.fromId));
-      if (!relation) throw new Error('Такой связи нет. Смотри id связей в текущем древе.');
-      tree.relations = tree.relations.filter(r => r.id !== relation.id);
-      return { from: find(tree, relation.fromId).name, to: find(tree, relation.toId).name, type: relation.type };
+    execute: async input => withPersistenceTransaction(() => {
+      const result = change('Убрана связь', tree => {
+        const relation = tree.relations.find(r => input.relationId
+          ? r.id === input.relationId
+          : (r.fromId === input.fromId && r.toId === input.toId) || (r.type === 'spouse' && r.fromId === input.toId && r.toId === input.fromId));
+        if (!relation) throw new Error('Такой связи нет. Смотри id связей в текущем древе.');
+        const output = { relation: structuredClone(relation), from: find(tree, relation.fromId).name, to: find(tree, relation.toId).name, type: relation.type };
+        tree.relations = tree.relations.filter(r => r.id !== relation.id);
+        return output;
+      });
+      recordRelationshipRemoval(result.relation);
+      return { from: result.from, to: result.to, type: result.type };
     }),
   }),
 
   remove_person: tool({
     description: 'Убрать человека из древа — только если пользователь прямо сказал, что это ошибка или дубль.',
     inputSchema: z.object({ id: z.string() }),
-    execute: async ({ id }) => change('Человек удалён', tree => {
+    execute: async ({ id }) => withPersistenceTransaction(() => {
+      const result = change('Человек удалён', tree => {
       const person = find(tree, id);
       tree.people = tree.people.filter(p => p.id !== id);
       tree.relations = tree.relations.filter(r => r.fromId !== id && r.toId !== id);
       return { removed: person.name };
+      });
+      reconcileResearchWithTree(getTree());
+      return result;
     }),
   }),
 };
