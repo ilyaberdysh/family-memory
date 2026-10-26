@@ -4,6 +4,7 @@
   "scripts": {
     "dev": "tsx watch server/index.ts",
     "build": "tsc --noEmit && vite build",
+    "test": "tsx --test tests/*.test.ts",
     "start": "NODE_ENV=production tsx server/index.ts"
   },
   "type": "module",

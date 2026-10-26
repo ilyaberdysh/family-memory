@@ -8,24 +8,54 @@ import type { Person, Relation, Tree, TreeState } from '../shared/types.js';
  * Enough for the local stand; moves to Postgres once accounts exist.
  */
 type File = Tree & { history: { label: string; before: Tree }[] };
+export type TreeStoreSnapshot = { exists: boolean; content?: string };
 
-const DATA_DIR = path.resolve(process.env.DATA_DIR ?? 'data');
-const FILE = path.join(DATA_DIR, 'tree.json');
 const HISTORY_LIMIT = 100;
 
+function filePath(): string {
+  return path.join(path.resolve(process.env.DATA_DIR ?? 'data'), 'tree.json');
+}
+
 function read(): File {
+  const file = filePath();
   try {
-    return JSON.parse(fs.readFileSync(FILE, 'utf8')) as File;
-  } catch {
-    return { people: [], relations: [], history: [] };
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<File>;
+    if (!Array.isArray(parsed.people) || !Array.isArray(parsed.relations)) throw new Error('tree.json повреждён: people и relations должны быть списками.');
+    return { people: parsed.people, relations: parsed.relations, history: Array.isArray(parsed.history) ? parsed.history : [] };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { people: [], relations: [], history: [] };
+    throw error;
   }
 }
 
 function write(file: File) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const temp = `${FILE}.${process.pid}.tmp`;
+  const target = filePath();
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const temp = `${target}.${process.pid}.tmp`;
   fs.writeFileSync(temp, JSON.stringify(file, null, 2));
-  fs.renameSync(temp, FILE);
+  fs.renameSync(temp, target);
+}
+
+export function snapshotTreeStore(): TreeStoreSnapshot {
+  const target = filePath();
+  try {
+    return { exists: true, content: fs.readFileSync(target, 'utf8') };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { exists: false };
+    throw error;
+  }
+}
+
+export function restoreTreeStore(snapshotValue: TreeStoreSnapshot): void {
+  const target = filePath();
+  if (!snapshotValue.exists) {
+    fs.rmSync(target, { force: true });
+    return;
+  }
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const temp = `${target}.${process.pid}.restore.tmp`;
+  fs.writeFileSync(temp, snapshotValue.content ?? '');
+  fs.renameSync(temp, target);
 }
 
 function snapshot(file: File): Tree {
